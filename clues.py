@@ -52,7 +52,24 @@ def parse_category(raw: str) -> str:
 
 
 def clue_contains_word(clue: str, word: str) -> bool:
-    return word.casefold() in clue.casefold()
+    """True if the secret (or a meaningful token of it) appears in the clue.
+
+    Uses word boundaries so short secrets like "art" do not match inside
+    "party". A suffix is allowed so "banana" still matches "bananas".
+    """
+    parts = [word.strip()]
+    parts.extend(token for token in word.strip().split() if len(token) > 3)
+    haystack = clue.casefold()
+    seen: set[str] = set()
+    for part in parts:
+        token = part.casefold()
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        pattern = r"(?<!\w)" + re.escape(token) + r"\w*"
+        if re.search(pattern, haystack):
+            return True
+    return False
 
 
 def generate_category_clue(

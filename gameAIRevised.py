@@ -48,6 +48,14 @@ def send_imessage(recipient: str, message: str, service_hint: str | None = None)
     os.system(osa)
 
 
+def prompt_int(message: str) -> int:
+    raw = input(message).strip()
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise SystemExit("Please enter a whole number.") from exc
+
+
 def prompt_yes_no(message: str, default: bool = True) -> bool:
     suffix = "Y/n" if default else "y/N"
     answer = input(f"{message} ({suffix}): ").strip().lower()
@@ -113,14 +121,24 @@ def setup(
     *,
     generate_clue: Callable[[str], str] | None = None,
 ) -> tuple[list[str], list[str], int]:
-    num_players = int(input("How many people are you playing with? ").strip())
+    num_players = prompt_int("How many people are you playing with? ")
+    if num_players < 3:
+        raise SystemExit("You need at least 3 players.")
     phonenumbers: list[str] = []
     print("\nEnter phone numbers (include +country code if needed):")
     for i in range(num_players):
-        number = input(f"Player {i + 1} phone number: ").strip()
-        phonenumbers.append(number)
+        while True:
+            number = input(f"Player {i + 1} phone number: ").strip()
+            if not number:
+                print("A phone number is required.")
+                continue
+            if number in phonenumbers:
+                print("That number is already in the game. Each player needs their own.")
+                continue
+            phonenumbers.append(number)
+            break
 
-    num_imposters = int(input("\nHow many imposters would you like? ").strip())
+    num_imposters = prompt_int("\nHow many imposters would you like? ")
     if num_imposters < 1:
         raise SystemExit("You need at least one imposter.")
     if num_imposters >= num_players:
@@ -186,7 +204,7 @@ def main() -> None:
                         word = input("Word: ").strip()
                         if not word:
                             break
-                        add_word_to_session(bank, wordbank, word)
+                        add_word_to_session(bank, wordbank, word, generate_clue=None)
                         clear_terminal()
                     if not wordbank:
                         print("Game over — no more words.")

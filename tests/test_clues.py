@@ -71,6 +71,8 @@ class GenerateClueTests(unittest.TestCase):
     def test_clue_contains_word(self) -> None:
         self.assertTrue(clue_contains_word("a kind of Apple", "apple"))
         self.assertFalse(clue_contains_word("orchard fruit", "apple"))
+        self.assertFalse(clue_contains_word("party games", "art"))
+        self.assertTrue(clue_contains_word("something about bananas", "banana"))
 
 
 class GetOrCreateClueTests(unittest.TestCase):

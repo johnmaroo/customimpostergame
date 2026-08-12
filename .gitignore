@@ -2,6 +2,8 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+# Keep your real key out of git. The empty .env template is tracked;
+# skip committing it again after you paste AI_GATEWAY_API_KEY.
 .env
 wordbank.db
 *.db

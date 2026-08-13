@@ -1,20 +1,24 @@
-"""In-memory party sessions for Imposter.
+"""Party sessions for Imposter.
 
 The web UI and tests both drive this module. Secrets (the round's word and
 who the imposters are) stay on the server and are only placed in a player's
 own view — never in the shared room snapshot.
+
+Rooms live in a `RoomStore` rather than in module state, so a table survives a
+server restart and can be picked up by whichever process handles the next
+request. Session tokens carry the room code and player id, which lets any
+process re-attach a phone by loading that one room.
 """
 
 from __future__ import annotations
 
-import json
+import hashlib
 import random
 import secrets
 import time
 from collections import Counter
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Literal
+from dataclasses import dataclass, field, fields
+from typing import Any, Literal, Protocol
 
 from prompts import IRL_MODES, pick_prompt, prompt_view
 
@@ -25,6 +29,11 @@ MAX_WORD_LEN = 48
 MAX_WORDS_PER_ROOM = 200
 ROOM_IDLE_SECONDS = 4 * 60 * 60
 USED_PROMPT_CAP = 20
+ROOM_SCHEMA_VERSION = 1
+# A phone polling every couple of seconds should keep its table alive without
+# writing to the store on every request.
+ACTIVITY_WRITE_SECONDS = 60.0
+TOKEN_SEPARATOR = "."
 
 Phase = Literal["lobby", "reveal", "discuss", "huddle", "guess", "vote", "results", "ended"]
 Winner = Literal["faithfuls", "imposters"]
@@ -33,10 +42,19 @@ IrlMode = Literal["off", "mix", "ask", "do"]
 
 
 class GameError(Exception):
-    def __init__(self, message: str, status_code: int = 400) -> None:
+    def __init__(self, message: str, status_code: int = 400, code: str = "game_error") -> None:
         super().__init__(message)
         self.message = message
         self.status_code = status_code
+        self.code = code
+
+
+class StoreConflict(Exception):
+    """Another writer changed this room first; the caller should retry."""
+
+
+class StoreUnavailable(Exception):
+    """The room store could not be reached. The table is not lost, just unreadable."""
 
 
 def _clean_name(name: str) -> str:
@@ -137,8 +155,44 @@ def _new_id() -> str:
     return secrets.token_urlsafe(9)
 
 
-def _new_token() -> str:
-    return secrets.token_urlsafe(24)
+def hash_token(token: str) -> str:
+    """Rooms are written to disk or a shared cache, so only hashes are stored."""
+    return hashlib.sha256((token or "").encode("utf-8")).hexdigest()
+
+
+def _session_token(code: str, player_id: str) -> str:
+    """A token that says which room and seat it belongs to, plus a secret."""
+    return TOKEN_SEPARATOR.join((code, player_id, secrets.token_urlsafe(24)))
+
+
+def _read_session_token(token: str) -> tuple[str, str] | None:
+    parts = (token or "").strip().split(TOKEN_SEPARATOR)
+    if len(parts) != 3 or not all(parts):
+        return None
+    code, player_id, _secret = parts
+    return code.upper(), player_id
+
+
+def _seat(code: str, name: str, *, is_host: bool, phone: str | None = None) -> Player:
+    player_id = _new_id()
+    return Player(
+        id=player_id,
+        name=name,
+        token=_session_token(code, player_id),
+        is_host=is_host,
+        phone=phone,
+    )
+
+
+def _invite_token(code: str) -> str:
+    return TOKEN_SEPARATOR.join((code, secrets.token_urlsafe(18)))
+
+
+def _read_invite_token(token: str) -> str | None:
+    parts = (token or "").strip().split(TOKEN_SEPARATOR)
+    if len(parts) != 2 or not all(parts):
+        return None
+    return parts[0].upper()
 
 
 @dataclass
@@ -150,6 +204,12 @@ class Player:
     score: int = 0
     connected: bool = True
     phone: str | None = None
+    token_hash: str = ""
+    last_seen: float = field(default_factory=time.time)
+
+    def __post_init__(self) -> None:
+        if not self.token_hash and self.token:
+            self.token_hash = hash_token(self.token)
 
 
 @dataclass
@@ -207,28 +267,318 @@ class Room:
     starter_counts: dict[str, int] = field(default_factory=dict)
     last_imposter_ids: list[str] = field(default_factory=list)
     last_speaking_order: list[str] = field(default_factory=list)
+    last_seen_at: float = field(default_factory=time.time)
+    version: int = 0
+
+
+def round_to_dict(rnd: RoundState) -> dict[str, Any]:
+    return {
+        "word": rnd.word,
+        "clue": rnd.clue,
+        "imposterIds": list(rnd.imposter_ids),
+        "participantIds": list(rnd.participant_ids),
+        "speakingOrder": list(rnd.speaking_order),
+        "speakerIndex": rnd.speaker_index,
+        "lap": rnd.lap,
+        "readyIds": sorted(rnd.ready_ids),
+        "votes": dict(rnd.votes),
+        "guesses": dict(rnd.guesses),
+        "discussEndsAt": rnd.discuss_ends_at,
+        "winner": rnd.winner,
+        "winReason": rnd.win_reason,
+        "guessedBy": rnd.guessed_by,
+        "clueUnlocked": rnd.clue_unlocked,
+        "eliminatedIds": list(rnd.eliminated_ids),
+        "scoreDelta": dict(rnd.score_delta),
+        "voteCounts": dict(rnd.vote_counts),
+        "prompt": dict(rnd.prompt) if rnd.prompt else None,
+    }
+
+
+def round_from_dict(data: dict[str, Any]) -> RoundState:
+    return RoundState(
+        word=data["word"],
+        clue=data.get("clue"),
+        imposter_ids=list(data.get("imposterIds") or []),
+        participant_ids=list(data.get("participantIds") or []),
+        speaking_order=list(data.get("speakingOrder") or []),
+        speaker_index=int(data.get("speakerIndex") or 0),
+        lap=int(data.get("lap") or 1),
+        ready_ids=set(data.get("readyIds") or []),
+        votes=dict(data.get("votes") or {}),
+        guesses=dict(data.get("guesses") or {}),
+        discuss_ends_at=data.get("discussEndsAt"),
+        winner=data.get("winner"),
+        win_reason=data.get("winReason"),
+        guessed_by=data.get("guessedBy"),
+        clue_unlocked=bool(data.get("clueUnlocked")),
+        eliminated_ids=list(data.get("eliminatedIds") or []),
+        score_delta=dict(data.get("scoreDelta") or {}),
+        vote_counts=dict(data.get("voteCounts") or {}),
+        prompt=dict(data["prompt"]) if data.get("prompt") else None,
+    )
+
+
+def room_to_dict(room: Room) -> dict[str, Any]:
+    """JSON-ready room. Bearer tokens are replaced by their hashes."""
+    return {
+        "schema": ROOM_SCHEMA_VERSION,
+        "code": room.code,
+        "players": [
+            {
+                "id": p.id,
+                "name": p.name,
+                "tokenHash": p.token_hash,
+                "isHost": p.is_host,
+                "score": p.score,
+                "connected": p.connected,
+                "phone": p.phone,
+                "lastSeen": p.last_seen,
+            }
+            for p in room.players.values()
+        ],
+        "remainingWords": list(room.remaining_words),
+        "usedWords": list(room.used_words),
+        "numImposters": room.num_imposters,
+        "discussSeconds": room.discuss_seconds,
+        "passAndPlay": room.pass_and_play,
+        "wordsVisible": room.words_visible,
+        "irlMode": room.irl_mode,
+        "imposterHints": room.imposter_hints,
+        "phase": room.phase,
+        "round": round_to_dict(room.round) if room.round else None,
+        "roundNumber": room.round_number,
+        "createdAt": room.created_at,
+        "updatedAt": room.updated_at,
+        "lastSeenAt": room.last_seen_at,
+        "invites": [
+            {
+                "token": inv.token,
+                "name": inv.name,
+                "phone": inv.phone,
+                "claimedBy": inv.claimed_by,
+            }
+            for inv in room.invites.values()
+        ],
+        "wordSources": dict(room.word_sources),
+        "usedPromptIds": list(room.used_prompt_ids),
+        "imposterCounts": dict(room.imposter_counts),
+        "starterCounts": dict(room.starter_counts),
+        "lastImposterIds": list(room.last_imposter_ids),
+        "lastSpeakingOrder": list(room.last_speaking_order),
+        "version": room.version,
+    }
+
+
+def room_from_dict(data: dict[str, Any]) -> Room:
+    players: dict[str, Player] = {}
+    for row in data.get("players") or []:
+        player = Player(
+            id=row["id"],
+            name=row["name"],
+            token="",
+            is_host=bool(row.get("isHost")),
+            score=int(row.get("score") or 0),
+            connected=bool(row.get("connected")),
+            phone=row.get("phone"),
+            token_hash=row.get("tokenHash") or "",
+            last_seen=float(row.get("lastSeen") or 0.0),
+        )
+        players[player.id] = player
+    invites: dict[str, Invite] = {}
+    for row in data.get("invites") or []:
+        invites[row["token"]] = Invite(
+            token=row["token"],
+            name=row["name"],
+            phone=row["phone"],
+            claimed_by=row.get("claimedBy"),
+        )
+    created = float(data.get("createdAt") or time.time())
+    updated = float(data.get("updatedAt") or created)
+    return Room(
+        code=data["code"],
+        players=players,
+        remaining_words=list(data.get("remainingWords") or []),
+        used_words=list(data.get("usedWords") or []),
+        num_imposters=int(data.get("numImposters") or 1),
+        discuss_seconds=int(data.get("discussSeconds") or 0),
+        pass_and_play=bool(data.get("passAndPlay")),
+        words_visible=bool(data.get("wordsVisible")),
+        irl_mode=data.get("irlMode") or "mix",
+        imposter_hints=bool(data.get("imposterHints")),
+        phase=data.get("phase") or "lobby",
+        round=round_from_dict(data["round"]) if data.get("round") else None,
+        round_number=int(data.get("roundNumber") or 0),
+        created_at=created,
+        updated_at=updated,
+        invites=invites,
+        word_sources=dict(data.get("wordSources") or {}),
+        used_prompt_ids=list(data.get("usedPromptIds") or []),
+        imposter_counts=dict(data.get("imposterCounts") or {}),
+        starter_counts=dict(data.get("starterCounts") or {}),
+        last_imposter_ids=list(data.get("lastImposterIds") or []),
+        last_speaking_order=list(data.get("lastSpeakingOrder") or []),
+        last_seen_at=float(data.get("lastSeenAt") or updated),
+        version=int(data.get("version") or 0),
+    )
+
+
+def serialized_round_fields() -> set[str]:
+    """Field names covered by `round_to_dict`, so new state cannot slip through."""
+    return {
+        "word",
+        "clue",
+        "imposter_ids",
+        "participant_ids",
+        "speaking_order",
+        "speaker_index",
+        "lap",
+        "ready_ids",
+        "votes",
+        "guesses",
+        "discuss_ends_at",
+        "winner",
+        "win_reason",
+        "guessed_by",
+        "clue_unlocked",
+        "eliminated_ids",
+        "score_delta",
+        "vote_counts",
+        "prompt",
+    }
+
+
+def serialized_room_fields() -> set[str]:
+    """Field names covered by `room_to_dict`, so new state cannot slip through."""
+    return {
+        "code",
+        "players",
+        "remaining_words",
+        "used_words",
+        "num_imposters",
+        "discuss_seconds",
+        "pass_and_play",
+        "words_visible",
+        "irl_mode",
+        "imposter_hints",
+        "phase",
+        "round",
+        "round_number",
+        "created_at",
+        "updated_at",
+        "invites",
+        "word_sources",
+        "used_prompt_ids",
+        "imposter_counts",
+        "starter_counts",
+        "last_imposter_ids",
+        "last_speaking_order",
+        "last_seen_at",
+        "version",
+    }
+
+
+def _refresh_players(target: Room, source: Room) -> None:
+    for player_id, incoming in source.players.items():
+        seated = target.players.get(player_id)
+        if seated is None:
+            target.players[player_id] = incoming
+            continue
+        for spot in fields(Player):
+            if spot.name == "token" and not getattr(incoming, "token"):
+                continue  # stored rooms only keep the hash; keep a freshly issued token
+            setattr(seated, spot.name, getattr(incoming, spot.name))
+    for player_id in [pid for pid in target.players if pid not in source.players]:
+        del target.players[player_id]
+
+
+def _refresh_invites(target: Room, source: Room) -> None:
+    for token, incoming in source.invites.items():
+        current = target.invites.get(token)
+        if current is None:
+            target.invites[token] = incoming
+            continue
+        for spot in fields(Invite):
+            setattr(current, spot.name, getattr(incoming, spot.name))
+    for token in [key for key in target.invites if key not in source.invites]:
+        del target.invites[token]
+
+
+def _refresh_round(target: Room, source: Room) -> None:
+    if source.round is None or target.round is None:
+        target.round = source.round
+        return
+    for spot in fields(RoundState):
+        setattr(target.round, spot.name, getattr(source.round, spot.name))
+
+
+def refresh_room(target: Room, source: Room) -> None:
+    """Pull stored state into the copy this process already handed out.
+
+    Callers hold on to `Room`, `Player` and `RoundState` objects between calls,
+    so a reload updates those objects in place rather than replacing them.
+    """
+    nested = {"players", "round", "invites"}
+    for spot in fields(Room):
+        if spot.name not in nested:
+            setattr(target, spot.name, getattr(source, spot.name))
+    _refresh_players(target, source)
+    _refresh_invites(target, source)
+    _refresh_round(target, source)
+
+
+class RoomStore(Protocol):
+    """Where tables live between requests."""
+
+    def load(self, code: str) -> Room | None: ...
+
+    def save(self, room: Room) -> None: ...
+
+    def delete(self, code: str) -> None: ...
+
+    def sweep(self, older_than: float) -> None: ...
+
+
+class MemoryStore:
+    """One process, one dict. LAN play and tests never leave this process."""
+
+    def __init__(self) -> None:
+        self.rooms: dict[str, Room] = {}
+
+    def load(self, code: str) -> Room | None:
+        return self.rooms.get(code)
+
+    def save(self, room: Room) -> None:
+        room.version += 1
+        self.rooms[room.code] = room
+
+    def delete(self, code: str) -> None:
+        self.rooms.pop(code, None)
+
+    def sweep(self, older_than: float) -> None:
+        stale = [code for code, room in self.rooms.items() if room.last_seen_at < older_than]
+        for code in stale:
+            self.rooms.pop(code, None)
 
 
 class GameHub:
     def __init__(
         self,
         rng: random.Random | None = None,
-        persist_path: str | Path | None = None,
+        store: RoomStore | None = None,
+        idle_seconds: float = ROOM_IDLE_SECONDS,
     ) -> None:
-        self.rooms: dict[str, Room] = {}
-        self.token_index: dict[str, tuple[str, str]] = {}
-        self.invite_index: dict[str, str] = {}
+        self.store: RoomStore = store if store is not None else MemoryStore()
+        self.idle_seconds = idle_seconds
         self.rng = rng if rng is not None else random.SystemRandom()
-        self.persist_path = Path(persist_path) if persist_path else None
-        self.restore()
+        self._live: dict[str, Room] = {}
 
     def create_room(self, host_name: str) -> tuple[Room, Player]:
         name = _clean_name(host_name)
         code = self._unique_code()
-        host = Player(id=_new_id(), name=name, token=_new_token(), is_host=True)
+        host = _seat(code, name, is_host=True)
         room = Room(code=code, players={host.id: host})
-        self.rooms[code] = room
-        self.token_index[host.token] = (code, host.id)
+        self._live[code] = room
         self._touch(room)
         return room, host
 
@@ -256,25 +606,26 @@ class GameHub:
             return self._reclaim_player(room, existing)
         if len(room.players) >= 16:
             raise GameError("This room is full (16 players).")
-        player = Player(
-            id=_new_id(),
-            name=cleaned,
-            token=_new_token(),
+        player = _seat(
+            room.code,
+            cleaned,
             is_host=False,
             phone=invite.phone if invite else None,
         )
         room.players[player.id] = player
-        self.token_index[player.token] = (room.code, player.id)
         if invite:
             invite.claimed_by = player.id
         self._touch(room)
         return room, player
 
     def _reclaim_player(self, room: Room, player: Player) -> tuple[Room, Player]:
-        self.token_index.pop(player.token, None)
-        player.token = _new_token()
+        """Sit somebody back down in the seat they already had.
+
+        Their old token stops working: the seat answers to the new one only.
+        """
+        player.token = _session_token(room.code, player.id)
+        player.token_hash = hash_token(player.token)
         player.connected = True
-        self.token_index[player.token] = (room.code, player.id)
         self._touch(room)
         return room, player
 
@@ -290,40 +641,41 @@ class GameHub:
             claimed_here = existing.claimed_by and existing.claimed_by in room.players
             if existing.phone == cleaned_phone and (not existing.claimed_by or claimed_here):
                 raise GameError("That number already has an invite.")
-        invite = Invite(token=_new_token(), name=cleaned_name, phone=cleaned_phone)
+        invite = Invite(token=_invite_token(room.code), name=cleaned_name, phone=cleaned_phone)
         room.invites[invite.token] = invite
-        self.invite_index[invite.token] = room.code
         self._touch(room)
         return invite
 
     def lookup_invite(self, token: str) -> tuple[Room, Invite]:
-        code = self.invite_index.get((token or "").strip())
+        cleaned = (token or "").strip()
+        code = _read_invite_token(cleaned)
         if not code:
-            raise GameError("That invite is no longer valid.", 404)
-        room = self.rooms.get(code)
+            raise GameError("That invite is no longer valid.", 404, "invite_invalid")
+        room = self._load(code)
         if room is None:
-            raise GameError("That room has closed.", 404)
-        invite = room.invites.get(token.strip())
+            raise GameError("That room has closed.", 404, "room_closed")
+        invite = room.invites.get(cleaned)
         if invite is None:
-            raise GameError("That invite is no longer valid.", 404)
+            raise GameError("That invite is no longer valid.", 404, "invite_invalid")
         if invite.claimed_by and invite.claimed_by in room.players:
-            raise GameError("That invite was already used.")
+            raise GameError("That invite was already used.", 400, "invite_claimed")
         return room, invite
 
-    def resolve_token(self, token: str | None) -> tuple[Room, Player]:
+    def resolve_token(self, token: str | None, now: float | None = None) -> tuple[Room, Player]:
+        """Re-attach a phone from its token alone, whichever process is serving."""
         if not token:
-            raise GameError("Sign in to this room first.", 401)
-        found = self.token_index.get(token)
-        if not found:
-            raise GameError("Session expired. Join again with the same name.", 401)
-        code, player_id = found
-        room = self.rooms.get(code)
+            raise GameError("Sign in to this room first.", 401, "no_session")
+        parsed = _read_session_token(token)
+        if parsed is None:
+            raise GameError("Session expired. Join again with the same name.", 401, "session_invalid")
+        code, player_id = parsed
+        room = self._load(code)
         if room is None:
-            raise GameError("That room has closed.", 404)
+            raise GameError("That room has closed.", 404, "room_closed")
         player = room.players.get(player_id)
-        if player is None:
-            raise GameError("You are no longer in this room.", 401)
-        player.connected = True
+        if player is None or not secrets.compare_digest(player.token_hash, hash_token(token)):
+            raise GameError("You are no longer in this room. Join again with the same name.", 401, "not_seated")
+        self._mark_seen(room, player, now=now)
         return room, player
 
     def leave(self, room: Room, player: Player) -> None:
@@ -745,20 +1097,16 @@ class GameHub:
         return payload
 
     def sweep_idle(self, now: float | None = None) -> None:
+        """Drop tables nobody has opened for a long time.
+
+        A phone that is still polling counts as activity, so a lobby waiting on
+        late guests stays open however long the wait takes.
+        """
         clock = time.time() if now is None else now
-        stale = [
-            code
-            for code, room in self.rooms.items()
-            if clock - room.updated_at > ROOM_IDLE_SECONDS
-        ]
-        for code in stale:
-            room = self.rooms.pop(code)
-            for player in room.players.values():
-                self.token_index.pop(player.token, None)
-            for token in room.invites:
-                self.invite_index.pop(token, None)
-        if stale:
-            self.persist()
+        cutoff = clock - self.idle_seconds
+        self.store.sweep(cutoff)
+        for code in [key for key, room in self._live.items() if room.last_seen_at < cutoff]:
+            self._live.pop(code, None)
 
     def _deal_prompt(
         self,
@@ -880,15 +1228,14 @@ class GameHub:
 
     def _remove_player(self, room: Room, player: Player) -> None:
         room.players.pop(player.id, None)
-        self.token_index.pop(player.token, None)
         room.imposter_counts.pop(player.id, None)
         room.starter_counts.pop(player.id, None)
         if player.is_host and room.players:
             successor = next(iter(room.players.values()))
             successor.is_host = True
         if not room.players:
-            self.rooms.pop(room.code, None)
-            self.persist()
+            self._live.pop(room.code, None)
+            self.store.delete(room.code)
             return
         self._touch(room)
 
@@ -937,187 +1284,46 @@ class GameHub:
 
     def _room(self, code: str) -> Room:
         key = (code or "").strip().upper()
-        room = self.rooms.get(key)
+        room = self._load(key)
         if room is None:
-            raise GameError("No room with that code.", 404)
+            raise GameError("No room with that code.", 404, "room_closed")
         return room
+
+    def _load(self, code: str) -> Room | None:
+        """Read a table, reusing the copy this process already has of it."""
+        stored = self.store.load(code)
+        if stored is None:
+            self._live.pop(code, None)
+            return None
+        live = self._live.get(code)
+        if live is None or live is stored:
+            self._live[code] = stored
+            return stored
+        refresh_room(live, stored)
+        return live
 
     def _unique_code(self) -> str:
         for _ in range(50):
             code = "".join(self.rng.choice(CODE_ALPHABET) for _ in range(4))
-            if code not in self.rooms:
+            if self._load(code) is None:
                 return code
         raise GameError("Could not create a room. Try again.", 500)
 
-    def persist(self) -> None:
-        if not self.persist_path:
-            return
-        payload = {"rooms": [self._dump_room(room) for room in self.rooms.values()]}
-        self.persist_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.persist_path.with_name(self.persist_path.name + ".tmp")
-        tmp.write_text(json.dumps(payload), encoding="utf-8")
-        tmp.replace(self.persist_path)
-
-    def restore(self) -> None:
-        if not self.persist_path or not self.persist_path.exists():
-            return
-        try:
-            payload = json.loads(self.persist_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return
-        self.rooms = {}
-        self.token_index = {}
-        self.invite_index = {}
-        for raw in payload.get("rooms") or []:
-            try:
-                room = self._load_room(raw)
-            except (KeyError, TypeError, ValueError):
-                continue
-            self.rooms[room.code] = room
-            for player in room.players.values():
-                self.token_index[player.token] = (room.code, player.id)
-            for token in room.invites:
-                self.invite_index[token] = room.code
-
-    def _dump_room(self, room: Room) -> dict[str, Any]:
-        rnd = room.round
-        return {
-            "code": room.code,
-            "players": [
-                {
-                    "id": p.id,
-                    "name": p.name,
-                    "token": p.token,
-                    "isHost": p.is_host,
-                    "score": p.score,
-                    "connected": p.connected,
-                    "phone": p.phone,
-                }
-                for p in room.players.values()
-            ],
-            "remainingWords": list(room.remaining_words),
-            "usedWords": list(room.used_words),
-            "numImposters": room.num_imposters,
-            "discussSeconds": room.discuss_seconds,
-            "passAndPlay": room.pass_and_play,
-            "wordsVisible": room.words_visible,
-            "irlMode": room.irl_mode,
-            "imposterHints": room.imposter_hints,
-            "phase": room.phase,
-            "roundNumber": room.round_number,
-            "createdAt": room.created_at,
-            "updatedAt": room.updated_at,
-            "invites": [
-                {
-                    "token": inv.token,
-                    "name": inv.name,
-                    "phone": inv.phone,
-                    "claimedBy": inv.claimed_by,
-                }
-                for inv in room.invites.values()
-            ],
-            "wordSources": dict(room.word_sources),
-            "usedPromptIds": list(room.used_prompt_ids),
-            "imposterCounts": dict(room.imposter_counts),
-            "starterCounts": dict(room.starter_counts),
-            "lastImposterIds": list(room.last_imposter_ids),
-            "lastSpeakingOrder": list(room.last_speaking_order),
-            "round": None
-            if rnd is None
-            else {
-                "word": rnd.word,
-                "clue": rnd.clue,
-                "imposterIds": list(rnd.imposter_ids),
-                "participantIds": list(rnd.participant_ids),
-                "speakingOrder": list(rnd.speaking_order),
-                "speakerIndex": rnd.speaker_index,
-                "lap": rnd.lap,
-                "readyIds": list(rnd.ready_ids),
-                "votes": dict(rnd.votes),
-                "guesses": dict(rnd.guesses),
-                "discussEndsAt": rnd.discuss_ends_at,
-                "winner": rnd.winner,
-                "winReason": rnd.win_reason,
-                "guessedBy": rnd.guessed_by,
-                "clueUnlocked": rnd.clue_unlocked,
-                "eliminatedIds": list(rnd.eliminated_ids),
-                "scoreDelta": dict(rnd.score_delta),
-                "voteCounts": dict(rnd.vote_counts),
-                "prompt": rnd.prompt,
-            },
-        }
-
-    def _load_room(self, raw: dict[str, Any]) -> Room:
-        players = {
-            row["id"]: Player(
-                id=row["id"],
-                name=row["name"],
-                token=row["token"],
-                is_host=bool(row.get("isHost")),
-                score=int(row.get("score") or 0),
-                connected=bool(row.get("connected", True)),
-                phone=row.get("phone"),
-            )
-            for row in raw.get("players") or []
-        }
-        invites = {
-            row["token"]: Invite(
-                token=row["token"],
-                name=row["name"],
-                phone=row["phone"],
-                claimed_by=row.get("claimedBy"),
-            )
-            for row in raw.get("invites") or []
-        }
-        rnd_raw = raw.get("round")
-        rnd = None
-        if rnd_raw:
-            rnd = RoundState(
-                word=rnd_raw["word"],
-                clue=rnd_raw.get("clue"),
-                imposter_ids=list(rnd_raw.get("imposterIds") or []),
-                participant_ids=list(rnd_raw.get("participantIds") or []),
-                speaking_order=list(rnd_raw.get("speakingOrder") or []),
-                speaker_index=int(rnd_raw.get("speakerIndex") or 0),
-                lap=int(rnd_raw.get("lap") or 1),
-                ready_ids=set(rnd_raw.get("readyIds") or []),
-                votes=dict(rnd_raw.get("votes") or {}),
-                guesses=dict(rnd_raw.get("guesses") or {}),
-                discuss_ends_at=rnd_raw.get("discussEndsAt"),
-                winner=rnd_raw.get("winner"),
-                win_reason=rnd_raw.get("winReason"),
-                guessed_by=rnd_raw.get("guessedBy"),
-                clue_unlocked=bool(rnd_raw.get("clueUnlocked")),
-                eliminated_ids=list(rnd_raw.get("eliminatedIds") or []),
-                score_delta=dict(rnd_raw.get("scoreDelta") or {}),
-                vote_counts=dict(rnd_raw.get("voteCounts") or {}),
-                prompt=rnd_raw.get("prompt"),
-            )
-        return Room(
-            code=str(raw["code"]).upper(),
-            players=players,
-            remaining_words=list(raw.get("remainingWords") or []),
-            used_words=list(raw.get("usedWords") or []),
-            num_imposters=int(raw.get("numImposters") or 1),
-            discuss_seconds=int(raw.get("discussSeconds") or 90),
-            pass_and_play=bool(raw.get("passAndPlay")),
-            words_visible=bool(raw.get("wordsVisible")),
-            irl_mode=raw.get("irlMode") or "mix",
-            imposter_hints=bool(raw.get("imposterHints", True)),
-            phase=raw.get("phase") or "lobby",
-            round=rnd,
-            round_number=int(raw.get("roundNumber") or 0),
-            created_at=float(raw.get("createdAt") or time.time()),
-            updated_at=float(raw.get("updatedAt") or time.time()),
-            invites=invites,
-            word_sources=dict(raw.get("wordSources") or {}),
-            used_prompt_ids=list(raw.get("usedPromptIds") or []),
-            imposter_counts=dict(raw.get("imposterCounts") or {}),
-            starter_counts=dict(raw.get("starterCounts") or {}),
-            last_imposter_ids=list(raw.get("lastImposterIds") or []),
-            last_speaking_order=list(raw.get("lastSpeakingOrder") or []),
-        )
-
     def _touch(self, room: Room, at: float | None = None) -> None:
         room.updated_at = time.time() if at is None else at
-        self.persist()
+        room.last_seen_at = max(room.last_seen_at, room.updated_at)
+        self.store.save(room)
+
+    def _mark_seen(self, room: Room, player: Player, now: float | None = None) -> None:
+        """Reading the room keeps it alive, without a store write per poll."""
+        clock = time.time() if now is None else now
+        player.connected = True
+        player.last_seen = clock
+        if clock - room.last_seen_at < ACTIVITY_WRITE_SECONDS:
+            return
+        room.last_seen_at = clock
+        try:
+            self.store.save(room)
+        except StoreConflict:
+            # Somebody else just wrote this room, which refreshed it anyway.
+            pass

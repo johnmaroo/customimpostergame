@@ -85,16 +85,16 @@ class GameHubTests(unittest.TestCase):
         import tempfile
         from pathlib import Path
 
+        from store import SqliteStore
+
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "rooms.json"
-            hub = GameHub(rng=random.Random(0), persist_path=path)
+            path = Path(tmp) / "rooms.db"
+            hub = GameHub(rng=random.Random(0), store=SqliteStore(path))
             room, host = hub.create_room("Host")
             hub.join_room(room.code, "Ava")
             hub.add_word(room, host, "Toaster")
-            code = room.code
             token = host.token
-            restored = GameHub(rng=random.Random(1), persist_path=path)
-            self.assertIn(code, restored.rooms)
+            restored = GameHub(rng=random.Random(1), store=SqliteStore(path))
             again, player = restored.resolve_token(token)
             self.assertEqual(player.name, "Host")
             self.assertEqual(again.remaining_words, ["Toaster"])

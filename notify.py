@@ -49,11 +49,19 @@ def sms_url(phone: str, message: str) -> str:
     return f"sms:{number}?body={quote(message)}"
 
 
+_QR_CACHE: dict[str, str] = {}
+
+
 def qr_svg(data: str) -> str:
+    cached = _QR_CACHE.get(data)
+    if cached is not None:
+        return cached
     if segno is None:
         raise RuntimeError("segno is required to draw QR codes")
     qr = segno.make(data, error="m")
-    return qr.svg_inline(scale=8, border=2, dark="#100c0a", light="#f6f0e6")
+    svg = qr.svg_inline(scale=8, border=2, dark="#100c0a", light="#f6f0e6")
+    _QR_CACHE[data] = svg
+    return svg
 
 
 def imessage_available() -> bool:

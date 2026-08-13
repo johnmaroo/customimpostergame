@@ -14,6 +14,7 @@ const state = {
   inviteToken: "",
   busy: false,
   lastInvite: null,
+  drafts: { word: "", inviteName: "", invitePhone: "", focus: "", selStart: null, selEnd: null },
 };
 
 const PALETTE = ["#e8c37a", "#ff8fa0", "#8ed6f7", "#9be7b7", "#c4b5fd", "#fb923c", "#f9a8d4", "#67e8f9"];
@@ -92,12 +93,79 @@ async function loadMeta() {
   }
 }
 
+function roomFingerprint(snap) {
+  if (!snap) return "";
+  return JSON.stringify({
+    phase: snap.phase,
+    roundNumber: snap.roundNumber,
+    code: snap.code,
+    canStart: snap.canStart,
+    remainingWordCount: snap.remainingWordCount,
+    usedWordCount: snap.usedWordCount,
+    numImposters: snap.numImposters,
+    discussSeconds: snap.discussSeconds,
+    passAndPlay: snap.passAndPlay,
+    wordsVisible: snap.wordsVisible,
+    words: snap.words,
+    usedWords: snap.usedWords,
+    speakerIndex: snap.speakerIndex,
+    discussEndsAt: snap.discussEndsAt,
+    players: snap.players,
+    invites: (snap.invites || []).map((inv) => [inv.token, inv.name, inv.claimed, inv.phoneMasked]),
+    you: snap.you,
+    result: snap.result,
+    joinUrl: snap.joinUrl,
+  });
+}
+
+function captureDrafts() {
+  const word = app.querySelector("#add-word [name=word]");
+  const inviteName = app.querySelector("#invite-form [name=name]");
+  const invitePhone = app.querySelector("#invite-form [name=phone]");
+  if (!word && !inviteName) return;
+  const active = document.activeElement;
+  const inApp = active && app.contains(active);
+  state.drafts = {
+    word: word ? word.value : state.drafts.word,
+    inviteName: inviteName ? inviteName.value : state.drafts.inviteName,
+    invitePhone: invitePhone ? invitePhone.value : state.drafts.invitePhone,
+    focus: inApp ? (active.getAttribute("name") || active.id || "") : "",
+    selStart: inApp && "selectionStart" in active ? active.selectionStart : null,
+    selEnd: inApp && "selectionEnd" in active ? active.selectionEnd : null,
+  };
+}
+
+function restoreDrafts() {
+  const drafts = state.drafts;
+  const word = app.querySelector("#add-word [name=word]");
+  if (word) word.value = drafts.word || "";
+  const inviteName = app.querySelector("#invite-form [name=name]");
+  if (inviteName) inviteName.value = drafts.inviteName || "";
+  const invitePhone = app.querySelector("#invite-form [name=phone]");
+  if (invitePhone) invitePhone.value = drafts.invitePhone || "";
+  if (!drafts.focus) return;
+  const focused = app.querySelector(`[name="${drafts.focus}"]`) || (drafts.focus && app.querySelector(`#${drafts.focus}`));
+  if (!focused) return;
+  focused.focus();
+  if (drafts.selStart == null || typeof focused.setSelectionRange !== "function") return;
+  try {
+    focused.setSelectionRange(drafts.selStart, drafts.selEnd ?? drafts.selStart);
+  } catch {
+    /* some inputs do not support a selection range */
+  }
+}
+
+let refreshInFlight = false;
+
 async function refresh() {
-  if (!state.token) return;
+  if (!state.token || refreshInFlight) return;
+  refreshInFlight = true;
   try {
     const snap = await api("/api/room");
-    const phaseChanged = state.snapshot && state.snapshot.phase !== snap.phase;
-    const roundChanged = state.snapshot && state.snapshot.roundNumber !== snap.roundNumber;
+    const phaseChanged = Boolean(state.snapshot && state.snapshot.phase !== snap.phase);
+    const roundChanged = Boolean(state.snapshot && state.snapshot.roundNumber !== snap.roundNumber);
+    const changed = roomFingerprint(state.snapshot) !== roomFingerprint(snap);
+    const hadError = Boolean(state.error);
     state.snapshot = snap;
     if (phaseChanged || roundChanged) {
       state.flipped = false;
@@ -105,21 +173,23 @@ async function refresh() {
       state.peek = null;
     }
     setError("");
-    render();
+    if (changed || phaseChanged || hadError) render();
   } catch (err) {
-    if (String(err.message).toLowerCase().includes("session") || String(err.message).toLowerCase().includes("join")) {
+    const message = String(err.message || "").toLowerCase();
+    if (message.includes("session expired") || message.includes("sign in to this room")) {
       setToken("");
       state.snapshot = null;
     }
     setError(err);
     render();
+  } finally {
+    refreshInFlight = false;
   }
 }
 
 async function act(fn) {
   if (state.busy) return;
   state.busy = true;
-  render();
   try {
     const result = await fn();
     if (result && result.token) setToken(result.token);
@@ -664,14 +734,17 @@ function renderResults() {
 }
 
 function render() {
+  if (state.snapshot && state.snapshot.phase === "lobby") captureDrafts();
   const s = state.snapshot;
   if (!s) {
     renderHome();
     return;
   }
   const phase = s.phase;
-  if (phase === "lobby") renderLobby();
-  else if (phase === "reveal") renderReveal();
+  if (phase === "lobby") {
+    renderLobby();
+    restoreDrafts();
+  } else if (phase === "reveal") renderReveal();
   else if (phase === "discuss") renderDiscuss();
   else if (phase === "vote") renderVote();
   else if (phase === "results") renderResults();
@@ -684,9 +757,22 @@ let timerId = 0;
 function tickTimers() {
   clearInterval(timerId);
   timerId = setInterval(() => {
-    if (state.snapshot?.phase === "discuss" && state.snapshot.discussEndsAt) {
-      if (remainingMs(state.snapshot) === 0) refresh();
-      else if (!state.busy) renderDiscuss();
+    const snap = state.snapshot;
+    if (snap?.phase !== "discuss" || !snap.discussEndsAt) return;
+    const ms = remainingMs(snap);
+    if (ms === 0) {
+      refresh();
+      return;
+    }
+    const timer = app.querySelector(".timer");
+    const bar = app.querySelector(".bar > span");
+    if (!timer) return;
+    timer.textContent = formatMs(ms);
+    timer.classList.toggle("warn", ms < 15000);
+    if (bar) {
+      const total = (snap.discussSeconds || 0) * 1000;
+      const pct = !total ? 100 : Math.max(0, Math.round((ms / total) * 100));
+      bar.style.setProperty("--p", `${pct}%`);
     }
   }, 250);
 }
@@ -694,8 +780,8 @@ function tickTimers() {
 function startPolling() {
   clearInterval(pollId);
   pollId = setInterval(() => {
-    if (state.token && !state.busy) refresh();
-  }, 800);
+    if (state.token && !state.busy && !refreshInFlight) refresh();
+  }, 2000);
 }
 
 async function boot() {

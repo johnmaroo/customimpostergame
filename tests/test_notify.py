@@ -34,6 +34,7 @@ class PhoneTests(unittest.TestCase):
         svg = qr_svg("http://192.168.1.9:8765/join/KNTQ")
         self.assertTrue(svg.lstrip().startswith("<svg"))
         self.assertIn("qrline", svg)
+        self.assertIs(svg, qr_svg("http://192.168.1.9:8765/join/KNTQ"))
 
 
 if __name__ == "__main__":

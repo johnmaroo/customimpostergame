@@ -39,10 +39,66 @@ class GameHubTests(unittest.TestCase):
         self.assertFalse(other.is_host)
         self.assertEqual(len(room.players), 2)
 
-    def test_duplicate_names_rejected(self) -> None:
-        room, _host = self.hub.create_room("Maya")
-        with self.assertRaises(GameError):
-            self.hub.join_room(room.code, "maya")
+    def test_same_name_rejoins_existing_seat(self) -> None:
+        room, host = self.hub.create_room("Maya")
+        old_token = host.token
+        host_id = host.id
+        room2, again = self.hub.join_room(room.code, "maya")
+        self.assertIs(room2, room)
+        self.assertEqual(again.id, host_id)
+        self.assertTrue(again.is_host)
+        self.assertNotEqual(again.token, old_token)
+        self.assertEqual(len(room.players), 1)
+        with self.assertRaises(GameError) as ctx:
+            self.hub.resolve_token(old_token)
+        self.assertEqual(ctx.exception.status_code, 401)
+        room3, player = self.hub.resolve_token(again.token)
+        self.assertEqual(player.id, host_id)
+        self.assertEqual(room3.code, room.code)
+
+    def test_rejoin_mid_round_keeps_role_and_score(self) -> None:
+        room, host, ava, ben = self._table(["Telescope"])
+        rnd = self.hub.start_round(room, host, clue="things for looking far away")
+        ava.score = 5
+        old_id = ava.id
+        _, back = self.hub.join_room(room.code, "Ava")
+        self.assertEqual(back.id, old_id)
+        self.assertEqual(back.score, 5)
+        view = self.hub.view_for(room, back)
+        self.assertEqual(view["you"]["id"], old_id)
+        if back.id in rnd.imposter_ids:
+            self.assertEqual(view["you"]["role"]["kind"], "imposter")
+        else:
+            self.assertEqual(view["you"]["role"]["word"], "Telescope")
+
+    def test_claimed_invite_rejoins_that_player(self) -> None:
+        room, host = self.hub.create_room("Host")
+        invite = self.hub.add_invite(room, host, "Jordan", "+15551234567")
+        _, jordan = self.hub.join_room(room.code, "Jordan", invite_token=invite.token)
+        old_token = jordan.token
+        _, again = self.hub.join_room(room.code, "Someone", invite_token=invite.token)
+        self.assertEqual(again.id, jordan.id)
+        self.assertEqual(again.phone, "+15551234567")
+        self.assertNotEqual(again.token, old_token)
+
+    def test_rooms_survive_a_new_hub_from_disk(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rooms.json"
+            hub = GameHub(rng=random.Random(0), persist_path=path)
+            room, host = hub.create_room("Host")
+            hub.join_room(room.code, "Ava")
+            hub.add_word(room, host, "Toaster")
+            code = room.code
+            token = host.token
+            restored = GameHub(rng=random.Random(1), persist_path=path)
+            self.assertIn(code, restored.rooms)
+            again, player = restored.resolve_token(token)
+            self.assertEqual(player.name, "Host")
+            self.assertEqual(again.remaining_words, ["Toaster"])
+            self.assertEqual(len(again.players), 2)
 
     def test_unknown_room(self) -> None:
         with self.assertRaises(GameError) as ctx:

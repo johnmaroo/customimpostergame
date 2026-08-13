@@ -7,11 +7,13 @@ own view — never in the shared room snapshot.
 
 from __future__ import annotations
 
+import json
 import random
 import secrets
 import time
 from collections import Counter
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal
 
 from prompts import IRL_MODES, pick_prompt, prompt_view
@@ -208,11 +210,17 @@ class Room:
 
 
 class GameHub:
-    def __init__(self, rng: random.Random | None = None) -> None:
+    def __init__(
+        self,
+        rng: random.Random | None = None,
+        persist_path: str | Path | None = None,
+    ) -> None:
         self.rooms: dict[str, Room] = {}
         self.token_index: dict[str, tuple[str, str]] = {}
         self.invite_index: dict[str, str] = {}
         self.rng = rng if rng is not None else random.SystemRandom()
+        self.persist_path = Path(persist_path) if persist_path else None
+        self.restore()
 
     def create_room(self, host_name: str) -> tuple[Room, Player]:
         name = _clean_name(host_name)
@@ -221,6 +229,7 @@ class GameHub:
         room = Room(code=code, players={host.id: host})
         self.rooms[code] = room
         self.token_index[host.token] = (code, host.id)
+        self._touch(room)
         return room, host
 
     def join_room(
@@ -235,12 +244,16 @@ class GameHub:
             invite = room.invites.get(invite_token.strip())
             if invite is None:
                 raise GameError("That invite is no longer valid.")
-            if invite.claimed_by and invite.claimed_by in room.players:
-                raise GameError("That invite was already used.")
+            claimed = room.players.get(invite.claimed_by or "")
+            if claimed:
+                return self._reclaim_player(room, claimed)
         cleaned = _clean_name(name or (invite.name if invite else ""))
-        taken = {p.name.casefold() for p in room.players.values()}
-        if cleaned.casefold() in taken:
-            raise GameError("That name is already in this room.")
+        existing = next(
+            (p for p in room.players.values() if p.name.casefold() == cleaned.casefold()),
+            None,
+        )
+        if existing:
+            return self._reclaim_player(room, existing)
         if len(room.players) >= 16:
             raise GameError("This room is full (16 players).")
         player = Player(
@@ -254,6 +267,14 @@ class GameHub:
         self.token_index[player.token] = (room.code, player.id)
         if invite:
             invite.claimed_by = player.id
+        self._touch(room)
+        return room, player
+
+    def _reclaim_player(self, room: Room, player: Player) -> tuple[Room, Player]:
+        self.token_index.pop(player.token, None)
+        player.token = _new_token()
+        player.connected = True
+        self.token_index[player.token] = (room.code, player.id)
         self._touch(room)
         return room, player
 
@@ -294,7 +315,7 @@ class GameHub:
             raise GameError("Sign in to this room first.", 401)
         found = self.token_index.get(token)
         if not found:
-            raise GameError("Session expired. Join the room again.", 401)
+            raise GameError("Session expired. Join again with the same name.", 401)
         code, player_id = found
         room = self.rooms.get(code)
         if room is None:
@@ -736,6 +757,8 @@ class GameHub:
                 self.token_index.pop(player.token, None)
             for token in room.invites:
                 self.invite_index.pop(token, None)
+        if stale:
+            self.persist()
 
     def _deal_prompt(
         self,
@@ -865,6 +888,7 @@ class GameHub:
             successor.is_host = True
         if not room.players:
             self.rooms.pop(room.code, None)
+            self.persist()
             return
         self._touch(room)
 
@@ -925,5 +949,165 @@ class GameHub:
                 return code
         raise GameError("Could not create a room. Try again.", 500)
 
+    def persist(self) -> None:
+        if not self.persist_path:
+            return
+        payload = {"rooms": [self._dump_room(room) for room in self.rooms.values()]}
+        self.persist_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.persist_path.with_name(self.persist_path.name + ".tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        tmp.replace(self.persist_path)
+
+    def restore(self) -> None:
+        if not self.persist_path or not self.persist_path.exists():
+            return
+        try:
+            payload = json.loads(self.persist_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        self.rooms = {}
+        self.token_index = {}
+        self.invite_index = {}
+        for raw in payload.get("rooms") or []:
+            try:
+                room = self._load_room(raw)
+            except (KeyError, TypeError, ValueError):
+                continue
+            self.rooms[room.code] = room
+            for player in room.players.values():
+                self.token_index[player.token] = (room.code, player.id)
+            for token in room.invites:
+                self.invite_index[token] = room.code
+
+    def _dump_room(self, room: Room) -> dict[str, Any]:
+        rnd = room.round
+        return {
+            "code": room.code,
+            "players": [
+                {
+                    "id": p.id,
+                    "name": p.name,
+                    "token": p.token,
+                    "isHost": p.is_host,
+                    "score": p.score,
+                    "connected": p.connected,
+                    "phone": p.phone,
+                }
+                for p in room.players.values()
+            ],
+            "remainingWords": list(room.remaining_words),
+            "usedWords": list(room.used_words),
+            "numImposters": room.num_imposters,
+            "discussSeconds": room.discuss_seconds,
+            "passAndPlay": room.pass_and_play,
+            "wordsVisible": room.words_visible,
+            "irlMode": room.irl_mode,
+            "imposterHints": room.imposter_hints,
+            "phase": room.phase,
+            "roundNumber": room.round_number,
+            "createdAt": room.created_at,
+            "updatedAt": room.updated_at,
+            "invites": [
+                {
+                    "token": inv.token,
+                    "name": inv.name,
+                    "phone": inv.phone,
+                    "claimedBy": inv.claimed_by,
+                }
+                for inv in room.invites.values()
+            ],
+            "wordSources": dict(room.word_sources),
+            "usedPromptIds": list(room.used_prompt_ids),
+            "imposterCounts": dict(room.imposter_counts),
+            "starterCounts": dict(room.starter_counts),
+            "lastImposterIds": list(room.last_imposter_ids),
+            "lastSpeakingOrder": list(room.last_speaking_order),
+            "round": None
+            if rnd is None
+            else {
+                "word": rnd.word,
+                "clue": rnd.clue,
+                "imposterIds": list(rnd.imposter_ids),
+                "participantIds": list(rnd.participant_ids),
+                "speakingOrder": list(rnd.speaking_order),
+                "speakerIndex": rnd.speaker_index,
+                "readyIds": list(rnd.ready_ids),
+                "votes": dict(rnd.votes),
+                "discussEndsAt": rnd.discuss_ends_at,
+                "winner": rnd.winner,
+                "eliminatedIds": list(rnd.eliminated_ids),
+                "scoreDelta": dict(rnd.score_delta),
+                "voteCounts": dict(rnd.vote_counts),
+                "prompt": rnd.prompt,
+            },
+        }
+
+    def _load_room(self, raw: dict[str, Any]) -> Room:
+        players = {
+            row["id"]: Player(
+                id=row["id"],
+                name=row["name"],
+                token=row["token"],
+                is_host=bool(row.get("isHost")),
+                score=int(row.get("score") or 0),
+                connected=bool(row.get("connected", True)),
+                phone=row.get("phone"),
+            )
+            for row in raw.get("players") or []
+        }
+        invites = {
+            row["token"]: Invite(
+                token=row["token"],
+                name=row["name"],
+                phone=row["phone"],
+                claimed_by=row.get("claimedBy"),
+            )
+            for row in raw.get("invites") or []
+        }
+        rnd_raw = raw.get("round")
+        rnd = None
+        if rnd_raw:
+            rnd = RoundState(
+                word=rnd_raw["word"],
+                clue=rnd_raw.get("clue"),
+                imposter_ids=list(rnd_raw.get("imposterIds") or []),
+                participant_ids=list(rnd_raw.get("participantIds") or []),
+                speaking_order=list(rnd_raw.get("speakingOrder") or []),
+                speaker_index=int(rnd_raw.get("speakerIndex") or 0),
+                ready_ids=set(rnd_raw.get("readyIds") or []),
+                votes=dict(rnd_raw.get("votes") or {}),
+                discuss_ends_at=rnd_raw.get("discussEndsAt"),
+                winner=rnd_raw.get("winner"),
+                eliminated_ids=list(rnd_raw.get("eliminatedIds") or []),
+                score_delta=dict(rnd_raw.get("scoreDelta") or {}),
+                vote_counts=dict(rnd_raw.get("voteCounts") or {}),
+                prompt=rnd_raw.get("prompt"),
+            )
+        return Room(
+            code=str(raw["code"]).upper(),
+            players=players,
+            remaining_words=list(raw.get("remainingWords") or []),
+            used_words=list(raw.get("usedWords") or []),
+            num_imposters=int(raw.get("numImposters") or 1),
+            discuss_seconds=int(raw.get("discussSeconds") or 90),
+            pass_and_play=bool(raw.get("passAndPlay")),
+            words_visible=bool(raw.get("wordsVisible")),
+            irl_mode=raw.get("irlMode") or "mix",
+            imposter_hints=bool(raw.get("imposterHints", True)),
+            phase=raw.get("phase") or "lobby",
+            round=rnd,
+            round_number=int(raw.get("roundNumber") or 0),
+            created_at=float(raw.get("createdAt") or time.time()),
+            updated_at=float(raw.get("updatedAt") or time.time()),
+            invites=invites,
+            word_sources=dict(raw.get("wordSources") or {}),
+            used_prompt_ids=list(raw.get("usedPromptIds") or []),
+            imposter_counts=dict(raw.get("imposterCounts") or {}),
+            starter_counts=dict(raw.get("starterCounts") or {}),
+            last_imposter_ids=list(raw.get("lastImposterIds") or []),
+            last_speaking_order=list(raw.get("lastSpeakingOrder") or []),
+        )
+
     def _touch(self, room: Room, at: float | None = None) -> None:
         room.updated_at = time.time() if at is None else at
+        self.persist()

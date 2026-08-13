@@ -10,7 +10,7 @@ const state = {
   hidden: false,
   peek: null,
   name: localStorage.getItem("imposter.name") || "",
-  joinCode: "",
+  joinCode: localStorage.getItem("imposter.room") || "",
   inviteToken: "",
   busy: false,
   lastInvite: null,
@@ -144,6 +144,7 @@ function goHome() {
       /* already gone */
     }
     setToken("");
+    forgetTable();
     state.snapshot = null;
     state.lastInvite = null;
     return {};
@@ -182,6 +183,36 @@ function setToken(token) {
   state.token = token || "";
   if (token) localStorage.setItem("imposter.token", token);
   else localStorage.removeItem("imposter.token");
+}
+
+function rememberTable(code) {
+  const value = String(code || "").trim().toUpperCase();
+  if (!value) return;
+  state.joinCode = value;
+  localStorage.setItem("imposter.room", value);
+}
+
+function forgetTable() {
+  state.joinCode = "";
+  localStorage.removeItem("imposter.room");
+}
+
+function rememberSnapshot(snap) {
+  if (snap && snap.code) rememberTable(snap.code);
+}
+
+async function reclaimSeat() {
+  const name = (state.name || "").trim();
+  const code = (state.joinCode || localStorage.getItem("imposter.room") || "").trim().toUpperCase();
+  if (!name || code.length !== 4) return false;
+  const result = await api("/api/rooms/join", {
+    method: "POST",
+    body: { name, code, inviteToken: state.inviteToken || undefined },
+  });
+  setToken(result.token);
+  state.snapshot = result.room;
+  rememberSnapshot(result.room);
+  return true;
 }
 
 function setError(err) {
@@ -290,6 +321,7 @@ async function refresh() {
     const changed = roomFingerprint(state.snapshot) !== roomFingerprint(snap);
     const hadError = Boolean(state.error);
     state.snapshot = snap;
+    rememberSnapshot(snap);
     if (phaseChanged || roundChanged) {
       state.flipped = false;
       state.hidden = false;
@@ -300,8 +332,20 @@ async function refresh() {
   } catch (err) {
     const message = String(err.message || "").toLowerCase();
     if (message.includes("session expired") || message.includes("sign in to this room")) {
+      if (state.snapshot?.code) rememberTable(state.snapshot.code);
       setToken("");
       state.snapshot = null;
+      try {
+        if (await reclaimSeat()) {
+          setError("");
+          render();
+          return;
+        }
+      } catch (reclaimErr) {
+        setError(reclaimErr);
+        render();
+        return;
+      }
     }
     setError(err);
     render();
@@ -316,8 +360,14 @@ async function act(fn) {
   try {
     const result = await fn();
     if (result && result.token) setToken(result.token);
-    if (result && result.room) state.snapshot = result.room;
-    else if (result && result.phase) state.snapshot = result;
+    if (result && result.room) {
+      state.snapshot = result.room;
+      rememberSnapshot(result.room);
+    }
+    else if (result && result.phase) {
+      state.snapshot = result;
+      rememberSnapshot(result);
+    }
     else if (result && result.role) {
       state.peek = result.role;
       state.snapshot = result.room;
@@ -361,13 +411,15 @@ function seatedInDealOrder(s) {
 }
 
 function renderHome() {
-  const code = state.joinCode || joinCodeFromLocation();
+  const fromLink = Boolean(joinCodeFromLocation());
+  const code = (fromLink ? joinCodeFromLocation() : state.joinCode) || "";
+  const returning = Boolean(code) && !fromLink;
   const scanned = Boolean(code);
   app.innerHTML = `<section class="screen stack-lg">
     ${toast()}
     <div class="hero">
-      <div class="kicker">${scanned ? "Scan received" : "Party game"}</div>
-      ${scanned ? `<div class="room-code">${esc(code)}</div><p class="lede">Enter your name to sit down at this table.</p>` : `<h1 class="title">IMPOSTER</h1><p class="lede">Most of you share a secret word. Someone does not. Talk around it — then vote out the faker.</p>`}
+      <div class="kicker">${returning ? "Welcome back" : scanned ? "Scan received" : "Party game"}</div>
+      ${scanned ? `<div class="room-code">${esc(code)}</div><p class="lede">${returning ? "Same name sits you back down at this table." : "Enter your name to sit down at this table."}</p>` : `<h1 class="title">IMPOSTER</h1><p class="lede">Most of you share a secret word. Someone does not. Talk around it — then vote out the faker.</p>`}
     </div>
     <label>Your name
       <input id="player-name" name="name" maxlength="24" autocomplete="nickname" value="${esc(state.name)}" placeholder="Maya" required />
@@ -407,7 +459,7 @@ function renderHome() {
   };
   const notThis = app.querySelector("#not-this-room");
   if (notThis) notThis.onclick = () => {
-    state.joinCode = "";
+    forgetTable();
     state.inviteToken = "";
     history.replaceState({}, "", "/");
     render();
@@ -1123,34 +1175,43 @@ function startPolling() {
 }
 
 async function boot() {
-  state.joinCode = joinCodeFromLocation();
+  state.joinCode = joinCodeFromLocation() || state.joinCode || localStorage.getItem("imposter.room") || "";
   state.inviteToken = inviteTokenFromLocation();
   await loadMeta();
   if (state.inviteToken && !state.token) {
     try {
       const info = await api(`/api/invites/${encodeURIComponent(state.inviteToken)}`);
       state.name = info.name;
-      state.joinCode = info.code;
       localStorage.setItem("imposter.name", info.name);
+      rememberTable(info.code);
       const result = await api("/api/rooms/join", {
         method: "POST",
         body: { name: info.name, code: info.code, inviteToken: state.inviteToken },
       });
       setToken(result.token);
       state.snapshot = result.room;
+      rememberSnapshot(result.room);
       history.replaceState({}, "", `/join/${info.code}`);
     } catch (err) {
-      setError(err);
+      try {
+        if (!(await reclaimSeat())) setError(err);
+      } catch (reclaimErr) {
+        setError(reclaimErr);
+      }
     }
   }
-  if (state.token) await refresh();
-  else render();
+  if (!state.snapshot && state.token) await refresh();
+  render();
   startPolling();
   tickTimers();
 }
 
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") refresh();
+});
+
+window.addEventListener("pageshow", () => {
+  if (state.token) refresh();
 });
 
 boot();

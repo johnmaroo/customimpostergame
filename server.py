@@ -23,6 +23,15 @@ from pydantic import BaseModel, Field
 
 from clues import get_or_create_clue, load_env_file, resolve_api_key
 from engine import GameError, GameHub
+from notify import (
+    deliver_invite,
+    imessage_available,
+    invite_message,
+    mask_phone,
+    normalize_phone,
+    qr_svg,
+    sms_url,
+)
 from packs import get_pack, list_packs
 from wordbank import WordBank
 
@@ -34,6 +43,7 @@ load_env_file()
 hub = GameHub()
 bank = WordBank()
 lock = threading.RLock()
+listen_port = 8765
 
 app = FastAPI(title="Imposter", docs_url=None, redoc_url=None)
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
@@ -46,6 +56,7 @@ class NameBody(BaseModel):
 class JoinBody(BaseModel):
     name: str = Field(min_length=1, max_length=24)
     code: str = Field(min_length=4, max_length=4)
+    inviteToken: str | None = None
 
 
 class WordBody(BaseModel):
@@ -73,6 +84,11 @@ class PeekBody(BaseModel):
 
 class KickBody(BaseModel):
     playerId: str
+
+
+class InviteBody(BaseModel):
+    name: str = Field(min_length=1, max_length=24)
+    phone: str = Field(min_length=7, max_length=24)
 
 
 def _token(authorization: str | None) -> str | None:
@@ -112,6 +128,46 @@ def _clue_for(word: str) -> str | None:
     return get_or_create_clue(bank, word)
 
 
+def lan_ip() -> str:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("8.8.8.8", 80))
+        return sock.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        sock.close()
+
+
+def public_origin(request: Request) -> str:
+    """Origin phones should open. Localhost is rewritten to the LAN address."""
+    host_header = request.headers.get("host") or f"127.0.0.1:{listen_port}"
+    hostname, separator, port = host_header.partition(":")
+    if hostname in {"127.0.0.1", "localhost", "::1", "[::1]"}:
+        hostname = lan_ip()
+        port = port or str(listen_port)
+        return f"http://{hostname}:{port}"
+    if not separator:
+        return f"{request.url.scheme}://{host_header}"
+    return f"{request.url.scheme}://{host_header}"
+
+
+def _snapshot(room, player, request: Request) -> dict[str, Any]:
+    view = hub.view_for(room, player)
+    origin = public_origin(request)
+    join_url = f"{origin}/join/{room.code}"
+    view["joinUrl"] = join_url
+    view["joinQrSvg"] = qr_svg(join_url)
+    view["canIMessage"] = imessage_available()
+    for invite in view.get("invites") or []:
+        invited_url = f"{join_url}?invite={invite['token']}"
+        message = invite_message(room.code, invited_url, invite["name"])
+        invite["phoneMasked"] = mask_phone(invite["phone"])
+        invite["smsUrl"] = sms_url(invite["phone"], message)
+        invite["joinUrl"] = invited_url
+    return view
+
+
 @app.exception_handler(GameError)
 async def game_error_handler(_request: Request, exc: GameError) -> JSONResponse:
     return _error(exc)
@@ -136,20 +192,23 @@ def join_page(code: str) -> FileResponse:
 
 
 @app.get("/api/meta")
-def meta() -> dict[str, Any]:
+def meta(request: Request) -> dict[str, Any]:
+    origin = public_origin(request)
     return {
         "hasAiKey": bool(resolve_api_key()),
         "savedWordCount": len(bank.all_words()),
         "packs": list_packs(),
+        "joinOrigin": origin,
+        "canIMessage": imessage_available(),
     }
 
 
 @app.post("/api/rooms")
-def create_room(body: NameBody) -> dict[str, Any]:
+def create_room(body: NameBody, request: Request) -> dict[str, Any]:
     with lock:
         room, player = hub.create_room(body.name)
         saved = bank.unused_words()
-        view = hub.view_for(room, player)
+        view = _snapshot(room, player, request)
     return {
         "token": player.token,
         "playerId": player.id,
@@ -159,24 +218,39 @@ def create_room(body: NameBody) -> dict[str, Any]:
 
 
 @app.post("/api/rooms/join")
-def join_room(body: JoinBody) -> dict[str, Any]:
+def join_room(body: JoinBody, request: Request) -> dict[str, Any]:
     with lock:
-        room, player = hub.join_room(body.code, body.name)
-        view = hub.view_for(room, player)
+        room, player = hub.join_room(body.code, body.name, invite_token=body.inviteToken)
+        view = _snapshot(room, player, request)
     return {"token": player.token, "playerId": player.id, "room": view}
 
 
+@app.get("/api/invites/{token}")
+def read_invite(token: str) -> dict[str, Any]:
+    with lock:
+        room, invite = hub.lookup_invite(token)
+    return {
+        "code": room.code,
+        "name": invite.name,
+        "phoneMasked": mask_phone(invite.phone),
+    }
+
+
 @app.get("/api/room")
-def get_room(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+def get_room(
+    request: Request, authorization: str | None = Header(default=None)
+) -> dict[str, Any]:
     with lock:
         hub.sweep_idle()
         room, player = hub.resolve_token(_token(authorization))
-        return hub.view_for(room, player)
+        return _snapshot(room, player, request)
 
 
 @app.post("/api/room/settings")
 def settings(
-    body: SettingsBody, authorization: str | None = Header(default=None)
+    body: SettingsBody,
+    request: Request,
+    authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     with lock:
         room, player = hub.resolve_token(_token(authorization))
@@ -188,112 +262,171 @@ def settings(
             pass_and_play=body.passAndPlay,
             words_visible=body.wordsVisible,
         )
-        return hub.view_for(room, player)
+        return _snapshot(room, player, request)
 
 
 @app.post("/api/room/words")
-def add_word(body: WordBody, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+def add_word(
+    body: WordBody,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
     with lock:
         room, player = hub.resolve_token(_token(authorization))
         word = hub.add_word(room, player, body.word)
         _persist_word(word)
-        return hub.view_for(room, player)
+        return _snapshot(room, player, request)
 
 
 @app.post("/api/room/words/saved")
-def load_saved(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+def load_saved(
+    request: Request, authorization: str | None = Header(default=None)
+) -> dict[str, Any]:
     with lock:
         room, player = hub.resolve_token(_token(authorization))
         words = bank.unused_words()
         if not words:
             raise GameError("No saved words yet. Add some here and they will stick around.")
         hub.add_words(room, player, words)
-        return hub.view_for(room, player)
+        return _snapshot(room, player, request)
 
 
 @app.post("/api/room/words/pack")
-def add_pack(body: PackBody, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+def add_pack(
+    body: PackBody,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
     pack = get_pack(body.packId)
     with lock:
         room, player = hub.resolve_token(_token(authorization))
         for word, fallback in pack["words"]:
             added = hub.add_word(room, player, word)
             _persist_word(added, fallback_clue=fallback)
-        return hub.view_for(room, player)
+        return _snapshot(room, player, request)
 
 
 @app.post("/api/room/words/recycle")
-def recycle(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+def recycle(
+    request: Request, authorization: str | None = Header(default=None)
+) -> dict[str, Any]:
     with lock:
         room, player = hub.resolve_token(_token(authorization))
         hub.recycle_words(room, player)
-        return hub.view_for(room, player)
+        return _snapshot(room, player, request)
 
 
 @app.post("/api/room/words/remove")
-def remove_word(body: WordBody, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+def remove_word(
+    body: WordBody,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
     with lock:
         room, player = hub.resolve_token(_token(authorization))
         hub.remove_word(room, player, body.word)
-        return hub.view_for(room, player)
+        return _snapshot(room, player, request)
+
+
+@app.post("/api/room/invite")
+def invite_player(
+    body: InviteBody,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    phone = normalize_phone(body.phone)
+    with lock:
+        room, player = hub.resolve_token(_token(authorization))
+        invite = hub.add_invite(room, player, body.name, phone)
+        view = _snapshot(room, player, request)
+    invited_url = f"{view['joinUrl']}?invite={invite.token}"
+    message = invite_message(room.code, invited_url, invite.name)
+    delivery = deliver_invite(invite.phone, message)
+    return {
+        "room": view,
+        "sent": delivery["sent"],
+        "method": delivery["method"],
+        "smsUrl": delivery["smsUrl"],
+        "inviteToken": invite.token,
+    }
 
 
 @app.post("/api/room/start")
-def start_round(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+def start_round(
+    request: Request, authorization: str | None = Header(default=None)
+) -> dict[str, Any]:
     with lock:
         room, player = hub.resolve_token(_token(authorization))
         rnd = hub.start_round(room, player, clue=None)
         rnd.clue = _clue_for(rnd.word)
         bank.mark_used(rnd.word)
-        return hub.view_for(room, player)
+        return _snapshot(room, player, request)
 
 
 @app.post("/api/room/ready")
-def ready(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+def ready(
+    request: Request, authorization: str | None = Header(default=None)
+) -> dict[str, Any]:
     with lock:
         room, player = hub.resolve_token(_token(authorization))
         hub.mark_ready(room, player)
-        return hub.view_for(room, player)
+        return _snapshot(room, player, request)
 
 
 @app.post("/api/room/peek")
-def peek(body: PeekBody, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+def peek(
+    body: PeekBody,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
     with lock:
         room, player = hub.resolve_token(_token(authorization))
         role = hub.peek_role(room, player, body.playerId)
-        return {"role": role, "room": hub.view_for(room, player)}
+        return {"role": role, "room": _snapshot(room, player, request)}
 
 
 @app.post("/api/room/next-speaker")
-def next_speaker(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+def next_speaker(
+    request: Request, authorization: str | None = Header(default=None)
+) -> dict[str, Any]:
     with lock:
         room, player = hub.resolve_token(_token(authorization))
         hub.next_speaker(room, player)
-        return hub.view_for(room, player)
+        return _snapshot(room, player, request)
 
 
 @app.post("/api/room/advance")
-def advance(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+def advance(
+    request: Request, authorization: str | None = Header(default=None)
+) -> dict[str, Any]:
     with lock:
         room, player = hub.resolve_token(_token(authorization))
         hub.advance(room, player)
-        return hub.view_for(room, player)
+        return _snapshot(room, player, request)
 
 
 @app.post("/api/room/vote")
-def vote(body: VoteBody, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+def vote(
+    body: VoteBody,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
     with lock:
         room, player = hub.resolve_token(_token(authorization))
         hub.vote(room, player, body.targetId)
-        return hub.view_for(room, player)
+        return _snapshot(room, player, request)
 
 
 @app.post("/api/room/kick")
-def kick(body: KickBody, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+def kick(
+    body: KickBody,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
     with lock:
         room, player = hub.resolve_token(_token(authorization))
         hub.kick(room, player, body.playerId)
-        return hub.view_for(room, player)
+        return _snapshot(room, player, request)
 
 
 @app.post("/api/room/leave")
@@ -304,32 +437,22 @@ def leave(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     return {"ok": True}
 
 
-def lan_ip() -> str:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        sock.connect(("8.8.8.8", 80))
-        return sock.getsockname()[0]
-    except OSError:
-        return "127.0.0.1"
-    finally:
-        sock.close()
-
-
 def main() -> None:
+    global listen_port
     parser = argparse.ArgumentParser(description="Imposter party game")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
+    listen_port = args.port
     display_ip = lan_ip() if args.host in {"0.0.0.0", "::"} else args.host
     print("\n  IMPOSTER")
     print("  --------")
     print(f"  This computer:  http://127.0.0.1:{args.port}")
     print(f"  Phones (Wi-Fi): http://{display_ip}:{args.port}")
+    print("  Friends can scan the QR in the lobby or get a texted join link.\n")
     if not resolve_api_key():
-        print("\n  Tip: add AI_GATEWAY_API_KEY to .env for custom-word category clues.")
+        print("  Tip: add AI_GATEWAY_API_KEY to .env for custom-word category clues.")
         print("  Starter packs still include fallback categories.\n")
-    else:
-        print()
     import uvicorn
 
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
@@ -337,3 +460,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

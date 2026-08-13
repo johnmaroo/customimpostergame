@@ -11,6 +11,7 @@ import random
 from collections.abc import Callable
 
 from clues import get_or_create_clue, load_env_file, resolve_api_key
+from notify import send_imessage
 from wordbank import WordBank
 
 load_env_file()
@@ -18,34 +19,6 @@ load_env_file()
 
 def clear_terminal() -> None:
     os.system("cls" if os.name == "nt" else "clear")
-
-
-def _escape_for_applescript(s: str) -> str:
-    """Escape quotes so the message is safe for AppleScript."""
-    return s.replace('"', '\\"')
-
-
-def send_imessage(recipient: str, message: str, service_hint: str | None = None) -> None:
-    """
-    Send an iMessage on macOS via AppleScript.
-    recipient: phone number or Apple ID linked to iMessage
-    message:   text to send
-    service_hint: optionally specify the service explicitly
-                  e.g. 'service "E:yourAppleID@icloud.com"'
-    """
-    msg = _escape_for_applescript(message)
-    rcpt = _escape_for_applescript(recipient)
-
-    if service_hint:
-        service_clause = f"of {service_hint}"
-    else:
-        service_clause = "of (service 1 whose service type is iMessage)"
-
-    osa = (
-        f"""osascript -e 'tell application "Messages" to send "{msg}" """
-        f"""to buddy "{rcpt}" {service_clause}' """
-    )
-    os.system(osa)
 
 
 def prompt_int(message: str) -> int:

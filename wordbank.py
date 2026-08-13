@@ -27,7 +27,7 @@ class WordBank:
     def __init__(self, db_path: str | Path = DEFAULT_DB_PATH):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.db_path)
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(_SCHEMA)
@@ -88,5 +88,39 @@ class WordBank:
         self.conn.execute(
             "UPDATE words SET last_used_at = datetime('now') WHERE word_normalized = ?",
             (normalize_word(word),),
+        )
+        self.conn.commit()
+
+    def remove_word(self, word: str) -> bool:
+        cursor = self.conn.execute(
+            "DELETE FROM words WHERE word_normalized = ?",
+            (normalize_word(word),),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def unused_words(self) -> list[str]:
+        """Words that have never been dealt, then least-recently used."""
+        rows = self.conn.execute(
+            """
+            SELECT word FROM words
+            ORDER BY CASE WHEN last_used_at IS NULL THEN 0 ELSE 1 END,
+                     last_used_at ASC,
+                     word COLLATE NOCASE
+            """
+        ).fetchall()
+        return [row["word"] for row in rows]
+
+    def set_clue_if_empty(self, word: str, clue: str) -> None:
+        cleaned = clue.strip()
+        if not cleaned:
+            raise ValueError("clue is required")
+        self.conn.execute(
+            """
+            UPDATE words
+            SET category_clue = ?
+            WHERE word_normalized = ? AND (category_clue IS NULL OR category_clue = '')
+            """,
+            (cleaned, normalize_word(word)),
         )
         self.conn.commit()

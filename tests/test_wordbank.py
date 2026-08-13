@@ -49,6 +49,15 @@ class WordBankTests(unittest.TestCase):
         ).fetchone()
         self.assertIsNotNone(row["last_used_at"])
 
+    def test_remove_word_and_unused_order(self) -> None:
+        self.assertTrue(self.bank.add_word("banana"))
+        self.assertTrue(self.bank.add_word("mango"))
+        self.bank.mark_used("banana")
+        self.assertEqual(self.bank.unused_words()[0], "mango")
+        self.assertTrue(self.bank.remove_word("Banana"))
+        self.assertEqual(self.bank.all_words(), ["mango"])
+        self.assertFalse(self.bank.remove_word("missing"))
+
 
 if __name__ == "__main__":
     unittest.main()

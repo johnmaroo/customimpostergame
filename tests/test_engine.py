@@ -184,6 +184,67 @@ class GameHubTests(unittest.TestCase):
         with self.assertRaises(GameError):
             self.hub.add_invite(room, host, "Ben", "+15550001111")
 
+    def test_round_deals_shared_irl_prompt(self) -> None:
+        room, host, ava, ben = self._table(["Toaster"])
+        rnd = self.hub.start_round(room, host)
+        self.assertIsNotNone(rnd.prompt)
+        self.assertIn(rnd.prompt["kind"], {"ask", "do"})
+        views = [self.hub.view_for(room, p) for p in (host, ava, ben)]
+        texts = {view["prompt"]["text"] for view in views}
+        self.assertEqual(len(texts), 1)
+        self.assertEqual(views[0]["irlMode"], "mix")
+        for view in views:
+            blob = json.dumps(view)
+            if view["you"]["role"]["kind"] == "imposter":
+                self.assertNotIn("Toaster", blob)
+
+    def test_irl_off_skips_prompt(self) -> None:
+        room, host, _ava, _ben = self._table(["Toaster"])
+        self.hub.set_settings(room, host, irl_mode="off")
+        rnd = self.hub.start_round(room, host)
+        self.assertIsNone(rnd.prompt)
+        self.assertIsNone(self.hub.view_for(room, host)["prompt"])
+
+    def test_ask_mode_deals_a_question(self) -> None:
+        room, host, _ava, _ben = self._table(["Toaster"])
+        self.hub.set_settings(room, host, irl_mode="ask")
+        rnd = self.hub.start_round(room, host)
+        self.assertEqual(rnd.prompt["kind"], "ask")
+
+    def test_host_can_swap_prompt_during_discuss(self) -> None:
+        room, host, ava, ben = self._table(["Toaster"])
+        self.hub.start_round(room, host)
+        first = room.round.prompt["id"]
+        for player in (host, ava, ben):
+            self.hub.mark_ready(room, player)
+        swapped = self.hub.next_prompt(room, host)
+        self.assertIsNotNone(swapped)
+        self.assertNotEqual(swapped["id"], first)
+        self.assertEqual(room.round.prompt["id"], swapped["id"])
+
+    def test_guest_can_add_words_in_lobby(self) -> None:
+        room, _host, ava, _ben = self._table(["Toaster"])
+        added = self.hub.add_word(room, ava, "Waffle")
+        self.assertEqual(added, "Waffle")
+        self.assertIn("Waffle", room.remaining_words)
+
+    def test_guest_cannot_add_words_during_a_round(self) -> None:
+        room, host, ava, _ben = self._table(["Toaster"])
+        self.hub.start_round(room, host)
+        with self.assertRaises(GameError):
+            self.hub.add_word(room, ava, "Waffle")
+
+    def test_guest_cannot_load_saved_words(self) -> None:
+        room, _host, ava, _ben = self._table(["Toaster"])
+        with self.assertRaises(GameError) as ctx:
+            self.hub.add_words(room, ava, ["Secret"])
+        self.assertEqual(ctx.exception.status_code, 403)
+
+    def test_invalid_irl_mode_rejected(self) -> None:
+        room, host, _ava, _ben = self._table()
+        with self.assertRaises(GameError):
+            self.hub.set_settings(room, host, irl_mode="dares")
+
 
 if __name__ == "__main__":
     unittest.main()

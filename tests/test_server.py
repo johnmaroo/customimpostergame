@@ -136,6 +136,12 @@ class ServerApiTests(unittest.TestCase):
             self.client.post("/api/room/ready", headers=auth(token))
         discuss = self.client.get("/api/room", headers=auth(host["token"])).json()
         self.assertEqual(discuss["phase"], "discuss")
+        self.assertIsNotNone(discuss["prompt"])
+        self.assertEqual(discuss["prompt"], self.client.get("/api/room", headers=auth(ava["token"])).json()["prompt"])
+
+        swapped = self.client.post("/api/room/next-prompt", headers=auth(host["token"]))
+        self.assertEqual(swapped.status_code, 200)
+        self.assertNotEqual(swapped.json()["prompt"]["id"], discuss["prompt"]["id"])
 
         self.client.post("/api/room/advance", headers=auth(host["token"]))
         vote_state = self.client.get("/api/room", headers=auth(host["token"])).json()
@@ -147,6 +153,25 @@ class ServerApiTests(unittest.TestCase):
             headers=auth(host["token"]),
         )
         self.assertEqual(voted.status_code, 200)
+
+    def test_guest_can_add_a_word_in_lobby(self) -> None:
+        host = self.client.post("/api/rooms", json={"name": "Host"}).json()
+        code = host["room"]["code"]
+        ava = self.client.post("/api/rooms/join", json={"name": "Ava", "code": code}).json()
+        added = self.client.post(
+            "/api/room/words",
+            json={"word": "Waffle"},
+            headers={"Authorization": f"Bearer {ava['token']}"},
+        )
+        self.assertEqual(added.status_code, 200)
+        self.assertEqual(added.json()["remainingWordCount"], 1)
+        packed = self.client.post(
+            "/api/room/words/pack",
+            json={"packId": "food"},
+            headers={"Authorization": f"Bearer {ava['token']}"},
+        )
+        self.assertEqual(packed.status_code, 200)
+        self.assertGreaterEqual(packed.json()["remainingWordCount"], 12)
 
 
 if __name__ == "__main__":

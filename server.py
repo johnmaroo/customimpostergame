@@ -36,14 +36,22 @@ from notify import (
     sms_url,
 )
 from packs import get_pack, list_packs
-from wordbank import WordBank
+from wordbank import WordBank, default_db_path
 
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
 
 load_env_file()
 
-hub = GameHub()
+
+def _rooms_path() -> Path:
+    override = os.getenv("IMPOSTER_ROOMS_PATH")
+    if override:
+        return Path(override)
+    return default_db_path().with_name("imposter-rooms.json")
+
+
+hub = GameHub(persist_path=_rooms_path())
 bank = WordBank()
 lock = threading.RLock()
 listen_port = 8765
@@ -95,6 +103,10 @@ class SettingsBody(BaseModel):
     wordsVisible: bool | None = None
     irlMode: str | None = None
     imposterHints: bool | None = None
+
+
+class GuessBody(BaseModel):
+    word: str | None = None
 
 
 class VoteBody(BaseModel):
@@ -434,6 +446,16 @@ def next_speaker(
         return _snapshot(room, player, request)
 
 
+@app.post("/api/room/around-again")
+def around_again(
+    request: Request, authorization: str | None = Header(default=None)
+) -> dict[str, Any]:
+    with lock:
+        room, player = hub.resolve_token(_token(authorization))
+        hub.go_around_again(room, player)
+        return _snapshot(room, player, request)
+
+
 @app.post("/api/room/next-prompt")
 def next_prompt(
     request: Request, authorization: str | None = Header(default=None)
@@ -441,6 +463,18 @@ def next_prompt(
     with lock:
         room, player = hub.resolve_token(_token(authorization))
         hub.next_prompt(room, player)
+        return _snapshot(room, player, request)
+
+
+@app.post("/api/room/guess")
+def guess_word(
+    body: GuessBody,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    with lock:
+        room, player = hub.resolve_token(_token(authorization))
+        hub.guess_word(room, player, body.word)
         return _snapshot(room, player, request)
 
 

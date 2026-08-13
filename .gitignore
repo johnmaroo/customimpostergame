@@ -4,6 +4,7 @@ __pycache__/
 venv/
 .env
 wordbank.db
+imposter-rooms.json
 *.db
 .pytest_cache/
 .DS_Store

@@ -7,11 +7,13 @@ own view — never in the shared room snapshot.
 
 from __future__ import annotations
 
+import json
 import random
 import secrets
 import time
 from collections import Counter
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal
 
 from prompts import IRL_MODES, pick_prompt, prompt_view
@@ -24,8 +26,9 @@ MAX_WORDS_PER_ROOM = 200
 ROOM_IDLE_SECONDS = 4 * 60 * 60
 USED_PROMPT_CAP = 20
 
-Phase = Literal["lobby", "reveal", "discuss", "vote", "results", "ended"]
+Phase = Literal["lobby", "reveal", "discuss", "huddle", "guess", "vote", "results", "ended"]
 Winner = Literal["faithfuls", "imposters"]
+WinReason = Literal["guess", "vote"]
 IrlMode = Literal["off", "mix", "ask", "do"]
 
 
@@ -52,6 +55,16 @@ def _clean_word(word: str) -> str:
     if len(cleaned) > MAX_WORD_LEN:
         raise GameError(f"Words can be at most {MAX_WORD_LEN} characters.")
     return cleaned
+
+
+def _normalize_guess(text: str) -> str:
+    pieces: list[str] = []
+    for ch in text or "":
+        if ch.isalnum() or ch.isspace():
+            pieces.append(ch.lower())
+        else:
+            pieces.append(" ")
+    return " ".join("".join(pieces).split())
 
 
 def _sample_by_fewest(
@@ -155,10 +168,15 @@ class RoundState:
     participant_ids: list[str]
     speaking_order: list[str]
     speaker_index: int = 0
+    lap: int = 1
     ready_ids: set[str] = field(default_factory=set)
     votes: dict[str, str | None] = field(default_factory=dict)
+    guesses: dict[str, str] = field(default_factory=dict)
     discuss_ends_at: float | None = None
     winner: Winner | None = None
+    win_reason: WinReason | None = None
+    guessed_by: str | None = None
+    clue_unlocked: bool = False
     eliminated_ids: list[str] = field(default_factory=list)
     score_delta: dict[str, int] = field(default_factory=dict)
     vote_counts: dict[str, int] = field(default_factory=dict)
@@ -192,11 +210,17 @@ class Room:
 
 
 class GameHub:
-    def __init__(self, rng: random.Random | None = None) -> None:
+    def __init__(
+        self,
+        rng: random.Random | None = None,
+        persist_path: str | Path | None = None,
+    ) -> None:
         self.rooms: dict[str, Room] = {}
         self.token_index: dict[str, tuple[str, str]] = {}
         self.invite_index: dict[str, str] = {}
         self.rng = rng if rng is not None else random.SystemRandom()
+        self.persist_path = Path(persist_path) if persist_path else None
+        self.restore()
 
     def create_room(self, host_name: str) -> tuple[Room, Player]:
         name = _clean_name(host_name)
@@ -205,6 +229,7 @@ class GameHub:
         room = Room(code=code, players={host.id: host})
         self.rooms[code] = room
         self.token_index[host.token] = (code, host.id)
+        self._touch(room)
         return room, host
 
     def join_room(
@@ -219,12 +244,16 @@ class GameHub:
             invite = room.invites.get(invite_token.strip())
             if invite is None:
                 raise GameError("That invite is no longer valid.")
-            if invite.claimed_by and invite.claimed_by in room.players:
-                raise GameError("That invite was already used.")
+            claimed = room.players.get(invite.claimed_by or "")
+            if claimed:
+                return self._reclaim_player(room, claimed)
         cleaned = _clean_name(name or (invite.name if invite else ""))
-        taken = {p.name.casefold() for p in room.players.values()}
-        if cleaned.casefold() in taken:
-            raise GameError("That name is already in this room.")
+        existing = next(
+            (p for p in room.players.values() if p.name.casefold() == cleaned.casefold()),
+            None,
+        )
+        if existing:
+            return self._reclaim_player(room, existing)
         if len(room.players) >= 16:
             raise GameError("This room is full (16 players).")
         player = Player(
@@ -238,6 +267,14 @@ class GameHub:
         self.token_index[player.token] = (room.code, player.id)
         if invite:
             invite.claimed_by = player.id
+        self._touch(room)
+        return room, player
+
+    def _reclaim_player(self, room: Room, player: Player) -> tuple[Room, Player]:
+        self.token_index.pop(player.token, None)
+        player.token = _new_token()
+        player.connected = True
+        self.token_index[player.token] = (room.code, player.id)
         self._touch(room)
         return room, player
 
@@ -278,7 +315,7 @@ class GameHub:
             raise GameError("Sign in to this room first.", 401)
         found = self.token_index.get(token)
         if not found:
-            raise GameError("Session expired. Join the room again.", 401)
+            raise GameError("Session expired. Join again with the same name.", 401)
         code, player_id = found
         room = self.rooms.get(code)
         if room is None:
@@ -498,18 +535,53 @@ class GameHub:
         self._require_host(host)
         self.tick(room)
         if room.phase != "discuss" or room.round is None:
-            raise GameError("Speaking order is only during discussion.")
-        room.round.speaker_index = min(
-            room.round.speaker_index + 1,
-            max(len(room.round.speaking_order) - 1, 0),
-        )
+            raise GameError("Speaking order is only during the circle.")
+        last = max(len(room.round.speaking_order) - 1, 0)
+        if room.round.speaker_index >= last:
+            raise GameError("That was the last person. Go around again or open the floor.")
+        room.round.speaker_index += 1
         self._touch(room)
 
-    def next_prompt(self, room: Room, host: Player) -> dict[str, str] | None:
-        """Host swaps the shared IRL prompt during reveal or discussion."""
+    def go_around_again(self, room: Room, host: Player) -> None:
         self._require_host(host)
         self.tick(room)
-        if room.phase not in ("reveal", "discuss") or room.round is None:
+        if room.phase != "discuss" or room.round is None:
+            raise GameError("You can only go around again during the circle.")
+        order = list(room.round.speaking_order)
+        if len(order) > 1:
+            order = order[1:] + order[:1]
+        room.round.speaking_order = order
+        room.round.speaker_index = 0
+        room.round.lap += 1
+        self._touch(room)
+
+    def guess_word(self, room: Room, player: Player, word: str | None) -> None:
+        """Imposters get one private shot at the word after the open floor."""
+        self.tick(room)
+        rnd = room.round
+        if room.phase != "guess" or rnd is None:
+            raise GameError("Guessing is not open yet.")
+        if player.id not in rnd.participant_ids:
+            raise GameError("You will play next round.")
+        if player.id not in rnd.imposter_ids:
+            raise GameError("Only imposters can guess the word.")
+        if player.id in rnd.guesses:
+            raise GameError("You already used your guess.")
+        cleaned = " ".join((word or "").split())
+        rnd.guesses[player.id] = cleaned
+        self._touch(room)
+        if cleaned and _normalize_guess(cleaned) == _normalize_guess(rnd.word):
+            self._resolve_guess_win(room, player.id)
+            return
+        seated = self._seated_imposters(room)
+        if seated and all(pid in rnd.guesses for pid in seated):
+            self._enter_vote(room)
+
+    def next_prompt(self, room: Room, host: Player) -> dict[str, str] | None:
+        """Host swaps the shared IRL prompt during reveal, the circle, or open floor."""
+        self._require_host(host)
+        self.tick(room)
+        if room.phase not in ("reveal", "discuss", "huddle") or room.round is None:
             raise GameError("IRL prompts can change during reveal or discussion.")
         if room.irl_mode == "off":
             raise GameError("Turn on IRL turns to deal a prompt.")
@@ -521,14 +593,17 @@ class GameHub:
         return prompt
 
     def advance(self, room: Room, host: Player, *, now: float | None = None) -> None:
-        """Host skips ahead: reveal → discuss → vote → results."""
+        """Host skips ahead: reveal → discuss → huddle → guess → vote → results."""
         self._require_host(host)
         self.tick(room, now=now)
         if room.phase == "reveal":
             self._enter_discuss(room, now=now)
         elif room.phase == "discuss":
-            room.phase = "vote"
-            self._touch(room)
+            self._enter_huddle(room, now=now)
+        elif room.phase == "huddle":
+            self._enter_guess(room, now=now)
+        elif room.phase == "guess":
+            self._enter_vote(room)
         elif room.phase == "vote":
             self._resolve_votes(room)
         else:
@@ -553,13 +628,12 @@ class GameHub:
     def tick(self, room: Room, now: float | None = None) -> None:
         clock = time.time() if now is None else now
         if (
-            room.phase == "discuss"
+            room.phase == "huddle"
             and room.round
             and room.round.discuss_ends_at is not None
             and clock >= room.round.discuss_ends_at
         ):
-            room.phase = "vote"
-            self._touch(room, at=clock)
+            self._enter_guess(room, now=clock)
 
     def view_for(self, room: Room, player: Player, *, now: float | None = None) -> dict[str, Any]:
         self.tick(room, now=now)
@@ -576,8 +650,23 @@ class GameHub:
             "ready": bool(rnd and player.id in rnd.ready_ids),
             "votedFor": rnd.votes.get(player.id) if rnd else None,
             "hasVoted": bool(rnd and player.id in rnd.votes),
+            "canGuess": bool(
+                rnd
+                and room.phase == "guess"
+                and not sitting_out
+                and player.id in rnd.imposter_ids
+                and player.id not in rnd.guesses
+            ),
+            "hasGuessed": bool(rnd and player.id in rnd.guesses),
+            "guessMissed": bool(
+                rnd
+                and player.id in rnd.guesses
+                and rnd.guesses.get(player.id)
+                and rnd.winner is None
+            ),
         }
-        if rnd and not sitting_out and room.phase in ("reveal", "discuss", "vote"):
+        live_phases = ("reveal", "discuss", "huddle", "guess", "vote")
+        if rnd and not sitting_out and room.phase in live_phases:
             you["role"] = self._role_payload(room, rnd, player.id, player.name)
         elif rnd and room.phase in ("results", "ended"):
             you["role"] = self._role_payload(room, rnd, player.id, player.name)
@@ -625,6 +714,7 @@ class GameHub:
             "players": players,
             "speakingOrder": speaking,
             "speakerIndex": rnd.speaker_index if rnd else 0,
+            "speakerLap": rnd.lap if rnd else 1,
             "discussEndsAt": rnd.discuss_ends_at if rnd else None,
             "updatedAt": room.updated_at,
         }
@@ -645,6 +735,8 @@ class GameHub:
                 "word": rnd.word,
                 "clue": rnd.clue,
                 "winner": rnd.winner,
+                "winReason": rnd.win_reason,
+                "guessedBy": rnd.guessed_by,
                 "imposterIds": list(rnd.imposter_ids),
                 "eliminatedIds": list(rnd.eliminated_ids),
                 "voteCounts": dict(rnd.vote_counts),
@@ -665,6 +757,8 @@ class GameHub:
                 self.token_index.pop(player.token, None)
             for token in room.invites:
                 self.invite_index.pop(token, None)
+        if stale:
+            self.persist()
 
     def _deal_prompt(
         self,
@@ -693,11 +787,58 @@ class GameHub:
             return
         clock = time.time() if now is None else now
         room.phase = "discuss"
+        room.round.discuss_ends_at = None
+        if room.round.lap < 1:
+            room.round.lap = 1
+        self._touch(room, at=clock)
+
+    def _enter_huddle(self, room: Room, now: float | None = None) -> None:
+        if room.round is None:
+            return
+        clock = time.time() if now is None else now
+        room.phase = "huddle"
         if room.discuss_seconds > 0:
             room.round.discuss_ends_at = clock + room.discuss_seconds
         else:
             room.round.discuss_ends_at = None
         self._touch(room, at=clock)
+
+    def _enter_guess(self, room: Room, now: float | None = None) -> None:
+        if room.round is None:
+            return
+        if room.pass_and_play:
+            self._enter_vote(room)
+            return
+        clock = time.time() if now is None else now
+        room.phase = "guess"
+        room.round.discuss_ends_at = None
+        self._touch(room, at=clock)
+
+    def _enter_vote(self, room: Room) -> None:
+        if room.round is None:
+            return
+        room.round.clue_unlocked = True
+        room.round.discuss_ends_at = None
+        room.phase = "vote"
+        self._touch(room)
+
+    def _resolve_guess_win(self, room: Room, guesser_id: str) -> None:
+        rnd = room.round
+        if rnd is None:
+            return
+        rnd.winner = "imposters"
+        rnd.win_reason = "guess"
+        rnd.guessed_by = guesser_id
+        rnd.clue_unlocked = True
+        delta: dict[str, int] = {}
+        for pid in rnd.participant_ids:
+            delta[pid] = 4 if pid in rnd.imposter_ids else 0
+            player = room.players.get(pid)
+            if player:
+                player.score += delta[pid]
+        rnd.score_delta = delta
+        room.phase = "results"
+        self._touch(room)
 
     def _resolve_votes(self, room: Room) -> None:
         rnd = room.round
@@ -715,6 +856,7 @@ class GameHub:
             rnd.winner = "faithfuls"
         else:
             rnd.winner = "imposters"
+        rnd.win_reason = "vote"
 
         delta: dict[str, int] = {}
         for pid in rnd.participant_ids:
@@ -746,6 +888,7 @@ class GameHub:
             successor.is_host = True
         if not room.players:
             self.rooms.pop(room.code, None)
+            self.persist()
             return
         self._touch(room)
 
@@ -762,10 +905,18 @@ class GameHub:
             return set()
         return set(room.round.participant_ids)
 
+    def _seated_imposters(self, room: Room) -> list[str]:
+        rnd = room.round
+        if rnd is None:
+            return []
+        return [pid for pid in rnd.imposter_ids if pid in room.players]
+
     def _role_payload(self, room: Room, rnd: RoundState, player_id: str, name: str) -> dict[str, Any]:
         if player_id in rnd.imposter_ids:
+            delayed_ok = room.pass_and_play or rnd.clue_unlocked
             show_clue = bool(rnd.clue) and (
-                room.imposter_hints or room.phase in ("results", "ended")
+                room.phase in ("results", "ended")
+                or (room.imposter_hints and delayed_ok)
             )
             return {
                 "kind": "imposter",
@@ -798,5 +949,175 @@ class GameHub:
                 return code
         raise GameError("Could not create a room. Try again.", 500)
 
+    def persist(self) -> None:
+        if not self.persist_path:
+            return
+        payload = {"rooms": [self._dump_room(room) for room in self.rooms.values()]}
+        self.persist_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.persist_path.with_name(self.persist_path.name + ".tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        tmp.replace(self.persist_path)
+
+    def restore(self) -> None:
+        if not self.persist_path or not self.persist_path.exists():
+            return
+        try:
+            payload = json.loads(self.persist_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        self.rooms = {}
+        self.token_index = {}
+        self.invite_index = {}
+        for raw in payload.get("rooms") or []:
+            try:
+                room = self._load_room(raw)
+            except (KeyError, TypeError, ValueError):
+                continue
+            self.rooms[room.code] = room
+            for player in room.players.values():
+                self.token_index[player.token] = (room.code, player.id)
+            for token in room.invites:
+                self.invite_index[token] = room.code
+
+    def _dump_room(self, room: Room) -> dict[str, Any]:
+        rnd = room.round
+        return {
+            "code": room.code,
+            "players": [
+                {
+                    "id": p.id,
+                    "name": p.name,
+                    "token": p.token,
+                    "isHost": p.is_host,
+                    "score": p.score,
+                    "connected": p.connected,
+                    "phone": p.phone,
+                }
+                for p in room.players.values()
+            ],
+            "remainingWords": list(room.remaining_words),
+            "usedWords": list(room.used_words),
+            "numImposters": room.num_imposters,
+            "discussSeconds": room.discuss_seconds,
+            "passAndPlay": room.pass_and_play,
+            "wordsVisible": room.words_visible,
+            "irlMode": room.irl_mode,
+            "imposterHints": room.imposter_hints,
+            "phase": room.phase,
+            "roundNumber": room.round_number,
+            "createdAt": room.created_at,
+            "updatedAt": room.updated_at,
+            "invites": [
+                {
+                    "token": inv.token,
+                    "name": inv.name,
+                    "phone": inv.phone,
+                    "claimedBy": inv.claimed_by,
+                }
+                for inv in room.invites.values()
+            ],
+            "wordSources": dict(room.word_sources),
+            "usedPromptIds": list(room.used_prompt_ids),
+            "imposterCounts": dict(room.imposter_counts),
+            "starterCounts": dict(room.starter_counts),
+            "lastImposterIds": list(room.last_imposter_ids),
+            "lastSpeakingOrder": list(room.last_speaking_order),
+            "round": None
+            if rnd is None
+            else {
+                "word": rnd.word,
+                "clue": rnd.clue,
+                "imposterIds": list(rnd.imposter_ids),
+                "participantIds": list(rnd.participant_ids),
+                "speakingOrder": list(rnd.speaking_order),
+                "speakerIndex": rnd.speaker_index,
+                "lap": rnd.lap,
+                "readyIds": list(rnd.ready_ids),
+                "votes": dict(rnd.votes),
+                "guesses": dict(rnd.guesses),
+                "discussEndsAt": rnd.discuss_ends_at,
+                "winner": rnd.winner,
+                "winReason": rnd.win_reason,
+                "guessedBy": rnd.guessed_by,
+                "clueUnlocked": rnd.clue_unlocked,
+                "eliminatedIds": list(rnd.eliminated_ids),
+                "scoreDelta": dict(rnd.score_delta),
+                "voteCounts": dict(rnd.vote_counts),
+                "prompt": rnd.prompt,
+            },
+        }
+
+    def _load_room(self, raw: dict[str, Any]) -> Room:
+        players = {
+            row["id"]: Player(
+                id=row["id"],
+                name=row["name"],
+                token=row["token"],
+                is_host=bool(row.get("isHost")),
+                score=int(row.get("score") or 0),
+                connected=bool(row.get("connected", True)),
+                phone=row.get("phone"),
+            )
+            for row in raw.get("players") or []
+        }
+        invites = {
+            row["token"]: Invite(
+                token=row["token"],
+                name=row["name"],
+                phone=row["phone"],
+                claimed_by=row.get("claimedBy"),
+            )
+            for row in raw.get("invites") or []
+        }
+        rnd_raw = raw.get("round")
+        rnd = None
+        if rnd_raw:
+            rnd = RoundState(
+                word=rnd_raw["word"],
+                clue=rnd_raw.get("clue"),
+                imposter_ids=list(rnd_raw.get("imposterIds") or []),
+                participant_ids=list(rnd_raw.get("participantIds") or []),
+                speaking_order=list(rnd_raw.get("speakingOrder") or []),
+                speaker_index=int(rnd_raw.get("speakerIndex") or 0),
+                lap=int(rnd_raw.get("lap") or 1),
+                ready_ids=set(rnd_raw.get("readyIds") or []),
+                votes=dict(rnd_raw.get("votes") or {}),
+                guesses=dict(rnd_raw.get("guesses") or {}),
+                discuss_ends_at=rnd_raw.get("discussEndsAt"),
+                winner=rnd_raw.get("winner"),
+                win_reason=rnd_raw.get("winReason"),
+                guessed_by=rnd_raw.get("guessedBy"),
+                clue_unlocked=bool(rnd_raw.get("clueUnlocked")),
+                eliminated_ids=list(rnd_raw.get("eliminatedIds") or []),
+                score_delta=dict(rnd_raw.get("scoreDelta") or {}),
+                vote_counts=dict(rnd_raw.get("voteCounts") or {}),
+                prompt=rnd_raw.get("prompt"),
+            )
+        return Room(
+            code=str(raw["code"]).upper(),
+            players=players,
+            remaining_words=list(raw.get("remainingWords") or []),
+            used_words=list(raw.get("usedWords") or []),
+            num_imposters=int(raw.get("numImposters") or 1),
+            discuss_seconds=int(raw.get("discussSeconds") or 90),
+            pass_and_play=bool(raw.get("passAndPlay")),
+            words_visible=bool(raw.get("wordsVisible")),
+            irl_mode=raw.get("irlMode") or "mix",
+            imposter_hints=bool(raw.get("imposterHints", True)),
+            phase=raw.get("phase") or "lobby",
+            round=rnd,
+            round_number=int(raw.get("roundNumber") or 0),
+            created_at=float(raw.get("createdAt") or time.time()),
+            updated_at=float(raw.get("updatedAt") or time.time()),
+            invites=invites,
+            word_sources=dict(raw.get("wordSources") or {}),
+            used_prompt_ids=list(raw.get("usedPromptIds") or []),
+            imposter_counts=dict(raw.get("imposterCounts") or {}),
+            starter_counts=dict(raw.get("starterCounts") or {}),
+            last_imposter_ids=list(raw.get("lastImposterIds") or []),
+            last_speaking_order=list(raw.get("lastSpeakingOrder") or []),
+        )
+
     def _touch(self, room: Room, at: float | None = None) -> None:
         room.updated_at = time.time() if at is None else at
+        self.persist()

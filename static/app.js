@@ -10,11 +10,11 @@ const state = {
   hidden: false,
   peek: null,
   name: localStorage.getItem("imposter.name") || "",
-  joinCode: "",
+  joinCode: localStorage.getItem("imposter.room") || "",
   inviteToken: "",
   busy: false,
   lastInvite: null,
-  drafts: { word: "", inviteName: "", invitePhone: "", focus: "", selStart: null, selEnd: null },
+    drafts: { word: "", inviteName: "", invitePhone: "", guess: "", focus: "", selStart: null, selEnd: null },
 };
 
 const PALETTE = ["#e8c37a", "#ff8fa0", "#8ed6f7", "#9be7b7", "#c4b5fd", "#fb923c", "#f9a8d4", "#67e8f9"];
@@ -144,6 +144,7 @@ function goHome() {
       /* already gone */
     }
     setToken("");
+    forgetTable();
     state.snapshot = null;
     state.lastInvite = null;
     return {};
@@ -184,6 +185,36 @@ function setToken(token) {
   else localStorage.removeItem("imposter.token");
 }
 
+function rememberTable(code) {
+  const value = String(code || "").trim().toUpperCase();
+  if (!value) return;
+  state.joinCode = value;
+  localStorage.setItem("imposter.room", value);
+}
+
+function forgetTable() {
+  state.joinCode = "";
+  localStorage.removeItem("imposter.room");
+}
+
+function rememberSnapshot(snap) {
+  if (snap && snap.code) rememberTable(snap.code);
+}
+
+async function reclaimSeat() {
+  const name = (state.name || "").trim();
+  const code = (state.joinCode || localStorage.getItem("imposter.room") || "").trim().toUpperCase();
+  if (!name || code.length !== 4) return false;
+  const result = await api("/api/rooms/join", {
+    method: "POST",
+    body: { name, code, inviteToken: state.inviteToken || undefined },
+  });
+  setToken(result.token);
+  state.snapshot = result.room;
+  rememberSnapshot(result.room);
+  return true;
+}
+
 function setError(err) {
   state.error = err ? String(err.message || err) : "";
 }
@@ -215,10 +246,23 @@ function roomFingerprint(snap) {
     words: snap.words,
     usedWords: snap.usedWords,
     speakerIndex: snap.speakerIndex,
+    speakerLap: snap.speakerLap,
     discussEndsAt: snap.discussEndsAt,
     players: snap.players,
     invites: (snap.invites || []).map((inv) => [inv.token, inv.name, inv.claimed, inv.phoneMasked]),
-    you: snap.you,
+    you: {
+      id: snap.you?.id,
+      isHost: snap.you?.isHost,
+      ready: snap.you?.ready,
+      hasVoted: snap.you?.hasVoted,
+      votedFor: snap.you?.votedFor,
+      canGuess: snap.you?.canGuess,
+      hasGuessed: snap.you?.hasGuessed,
+      guessMissed: snap.you?.guessMissed,
+      sittingOut: snap.you?.sittingOut,
+      role: snap.you?.role,
+      score: snap.you?.score,
+    },
     result: snap.result,
     joinUrl: snap.joinUrl,
   });
@@ -228,13 +272,15 @@ function captureDrafts() {
   const word = app.querySelector("#add-word [name=word]");
   const inviteName = app.querySelector("#invite-form [name=name]");
   const invitePhone = app.querySelector("#invite-form [name=phone]");
-  if (!word && !inviteName) return;
+  const guess = app.querySelector("#guess-form [name=guess]");
+  if (!word && !inviteName && !guess) return;
   const active = document.activeElement;
   const inApp = active && app.contains(active);
   state.drafts = {
     word: word ? word.value : state.drafts.word,
     inviteName: inviteName ? inviteName.value : state.drafts.inviteName,
     invitePhone: invitePhone ? invitePhone.value : state.drafts.invitePhone,
+    guess: guess ? guess.value : state.drafts.guess,
     focus: inApp ? (active.getAttribute("name") || active.id || "") : "",
     selStart: inApp && "selectionStart" in active ? active.selectionStart : null,
     selEnd: inApp && "selectionEnd" in active ? active.selectionEnd : null,
@@ -249,6 +295,8 @@ function restoreDrafts() {
   if (inviteName) inviteName.value = drafts.inviteName || "";
   const invitePhone = app.querySelector("#invite-form [name=phone]");
   if (invitePhone) invitePhone.value = drafts.invitePhone || "";
+  const guess = app.querySelector("#guess-form [name=guess]");
+  if (guess) guess.value = drafts.guess || "";
   if (!drafts.focus) return;
   const focused = app.querySelector(`[name="${drafts.focus}"]`) || (drafts.focus && app.querySelector(`#${drafts.focus}`));
   if (!focused) return;
@@ -273,6 +321,7 @@ async function refresh() {
     const changed = roomFingerprint(state.snapshot) !== roomFingerprint(snap);
     const hadError = Boolean(state.error);
     state.snapshot = snap;
+    rememberSnapshot(snap);
     if (phaseChanged || roundChanged) {
       state.flipped = false;
       state.hidden = false;
@@ -283,8 +332,20 @@ async function refresh() {
   } catch (err) {
     const message = String(err.message || "").toLowerCase();
     if (message.includes("session expired") || message.includes("sign in to this room")) {
+      if (state.snapshot?.code) rememberTable(state.snapshot.code);
       setToken("");
       state.snapshot = null;
+      try {
+        if (await reclaimSeat()) {
+          setError("");
+          render();
+          return;
+        }
+      } catch (reclaimErr) {
+        setError(reclaimErr);
+        render();
+        return;
+      }
     }
     setError(err);
     render();
@@ -299,8 +360,14 @@ async function act(fn) {
   try {
     const result = await fn();
     if (result && result.token) setToken(result.token);
-    if (result && result.room) state.snapshot = result.room;
-    else if (result && result.phase) state.snapshot = result;
+    if (result && result.room) {
+      state.snapshot = result.room;
+      rememberSnapshot(result.room);
+    }
+    else if (result && result.phase) {
+      state.snapshot = result;
+      rememberSnapshot(result);
+    }
     else if (result && result.role) {
       state.peek = result.role;
       state.snapshot = result.room;
@@ -344,13 +411,15 @@ function seatedInDealOrder(s) {
 }
 
 function renderHome() {
-  const code = state.joinCode || joinCodeFromLocation();
+  const fromLink = Boolean(joinCodeFromLocation());
+  const code = (fromLink ? joinCodeFromLocation() : state.joinCode) || "";
+  const returning = Boolean(code) && !fromLink;
   const scanned = Boolean(code);
   app.innerHTML = `<section class="screen stack-lg">
     ${toast()}
     <div class="hero">
-      <div class="kicker">${scanned ? "Scan received" : "Party game"}</div>
-      ${scanned ? `<div class="room-code">${esc(code)}</div><p class="lede">Enter your name to sit down at this table.</p>` : `<h1 class="title">IMPOSTER</h1><p class="lede">Most of you share a secret word. Someone does not. Talk around it — then vote out the faker.</p>`}
+      <div class="kicker">${returning ? "Welcome back" : scanned ? "Scan received" : "Party game"}</div>
+      ${scanned ? `<div class="room-code">${esc(code)}</div><p class="lede">${returning ? "Same name sits you back down at this table." : "Enter your name to sit down at this table."}</p>` : `<h1 class="title">IMPOSTER</h1><p class="lede">Most of you share a secret word. Someone does not. Talk around it — then vote out the faker.</p>`}
     </div>
     <label>Your name
       <input id="player-name" name="name" maxlength="24" autocomplete="nickname" value="${esc(state.name)}" placeholder="Maya" required />
@@ -373,12 +442,12 @@ function renderHome() {
     `}
     <button class="linkish" id="how-toggle" type="button">${state.howTo ? "Hide how to play" : "How to play"}</button>
     ${state.howTo ? `<div class="panel"><ol class="how-list">
-      <li>One person creates a room. Everyone else scans the QR on that screen, or gets a text with a join link.</li>
-      <li>You can also type the 4-letter code if you already have the site open.</li>
+      <li>One person creates a room. Everyone else scans the QR, gets a text, or types the 4-letter code.</li>
       <li>Anyone can tap a starter pack or type a custom word. The list stays hidden. Words save for next time.</li>
-      <li>Each player taps a private card: faithfuls see the word. Imposters see a broad category unless the host turns hints off.</li>
-      <li>Take turns on the same IRL prompt — a vibe, a reaction, a hot take — without naming the word.</li>
-      <li>Vote. If the table names an imposter, the faithfuls score. If not, the imposters do.</li>
+      <li>Faithfuls see the word. Imposters do not at first. The host can turn category hints off entirely.</li>
+      <li>Take turns on the same IRL prompt without naming the word. The host can go around again.</li>
+      <li>Then a short open floor to discuss. Imposters get one private guess — name the word and they win.</li>
+      <li>If they miss, the table votes. Catch an imposter and the faithfuls score.</li>
     </ol></div>` : ""}
   </section>`;
 
@@ -390,7 +459,7 @@ function renderHome() {
   };
   const notThis = app.querySelector("#not-this-room");
   if (notThis) notThis.onclick = () => {
-    state.joinCode = "";
+    forgetTable();
     state.inviteToken = "";
     history.replaceState({}, "", "/");
     render();
@@ -429,7 +498,7 @@ function irlLabel(mode) {
 
 function settingsPanel(s) {
   if (!s.you.isHost) {
-    return `<div class="panel hint">${s.numImposters} imposter${s.numImposters === 1 ? "" : "s"} · ${s.discussSeconds ? s.discussSeconds + "s discussion" : "host-run discussion"} · ${esc(irlLabel(s.irlMode))}${s.imposterHints === false ? " · no category hints" : ""}</div>`;
+    return `<div class="panel hint">${s.numImposters} imposter${s.numImposters === 1 ? "" : "s"} · ${s.discussSeconds ? s.discussSeconds + "s open floor" : "host-run open floor"} · ${esc(irlLabel(s.irlMode))}${s.imposterHints === false ? " · no category hints" : ""}</div>`;
   }
   return `<div class="panel stack">
     <div class="spread"><h3>Table rules</h3></div>
@@ -438,7 +507,7 @@ function settingsPanel(s) {
         ${[1, 2, 3].map((n) => `<option value="${n}"${s.numImposters === n ? " selected" : ""}>${n}</option>`).join("")}
       </select>
     </label>
-    <label>Discussion timer
+    <label>Open-floor timer
       <select id="discuss-seconds">
         ${[
           [0, "Host ends it"],
@@ -450,6 +519,7 @@ function settingsPanel(s) {
         ].map(([v, label]) => `<option value="${v}"${s.discussSeconds === v ? " selected" : ""}>${label}</option>`).join("")}
       </select>
     </label>
+    <p class="hint">After the speaking circle, a last moment to talk before imposters guess.</p>
     <label>IRL turns
       <select id="irl-mode">
         ${[
@@ -460,11 +530,11 @@ function settingsPanel(s) {
         ].map(([v, label]) => `<option value="${v}"${(s.irlMode || "mix") === v ? " selected" : ""}>${label}</option>`).join("")}
       </select>
     </label>
-    <p class="hint">Same vague prompt for everyone. Talk around the category, not the details.</p>
-    <label class="toggle">Category hints at the start
+    <p class="hint">Same vague prompt for everyone. Talk around the word, not the details.</p>
+    <label class="toggle">Category hints
       <input id="imposter-hints" type="checkbox"${s.imposterHints !== false ? " checked" : ""} />
     </label>
-    <p class="hint">Off: imposters only know they are the imposter. No category on the card.</p>
+    <p class="hint">Off: never. On: not at the start — only after a missed guess, or on the card in pass-and-play.</p>
     <label class="toggle">Pass one phone around
       <input id="pass-play" type="checkbox"${s.passAndPlay ? " checked" : ""} />
     </label>
@@ -662,7 +732,7 @@ function roleFace(role) {
       <h2>You are the Imposter</h2>
       ${role.clue
         ? `<p class="lede">Talk around this category:</p><div class="secret-word">${esc(role.clue)}</div>`
-        : `<p class="lede">No category this round. Listen hard and blend in.</p>`}
+        : `<p class="lede">You do not know the word yet. Listen to how people talk. After the circle you get one guess — name it and you win.</p>`}
     </div>`;
   }
   return `<div class="face face-back faithful">
@@ -804,42 +874,127 @@ function formatMs(ms) {
 
 function renderDiscuss() {
   const s = state.snapshot;
-  const ms = remainingMs(s);
   const speaker = s.speakingOrder[s.speakerIndex] || s.speakingOrder[0];
-  const total = (s.discussSeconds || 0) * 1000;
-  const pct = ms == null || !total ? 100 : Math.max(0, Math.round((ms / total) * 100));
-  const headline = s.prompt
-    ? (s.prompt.kind === "do" ? "Do this" : "Answer this")
-    : "Talk around the word";
-  const lede = s.prompt
-    ? "Keep it vague. Imposters only have a broad category."
-    : "Do not say it. Imposters should still sound like they belong.";
+  const last = Math.max((s.speakingOrder || []).length - 1, 0);
+  const atEnd = s.speakerIndex >= last;
+  const yourTurn = speaker && speaker.id === s.you.id;
   app.innerHTML = `<section class="screen stack-lg">
     ${toast()}
     <div>
-      <div class="kicker">Discussion</div>
-      <h2>${headline}</h2>
-      <p class="lede">${lede}</p>
+      <div class="kicker">Circle · lap ${s.speakerLap || 1}</div>
+      <h2>${yourTurn ? "Your turn" : (s.prompt ? (s.prompt.kind === "do" ? "Do this" : "Answer this") : "Talk around the word")}</h2>
+      <p class="lede">${s.prompt ? "Keep it vague. Imposters are listening for a guess later — do not hand them the word." : "Do not say it. Imposters are listening for a guess later — do not hand it to them."}</p>
     </div>
-    ${ms != null ? `<div class="timer${ms < 15000 ? " warn" : ""}">${formatMs(ms)}</div><div class="bar"><span style="--p:${pct}%"></span></div>` : `<p class="hint">No timer — host decides when to vote.</p>`}
     ${promptCard(s, { hostSwap: true })}
-    <div class="speaker">
-      <div class="kicker">Speaking now</div>
+    <div class="speaker${yourTurn ? " you" : ""}">
+      <div class="kicker">${yourTurn ? "You are speaking" : "Speaking now"}</div>
       <strong>${esc(speaker?.name || "—")}</strong>
       <p class="muted">${s.speakingOrder.map((p, i) => i === s.speakerIndex ? `<span class="gold">${esc(p.name)}</span>` : esc(p.name)).join(" → ")}</p>
     </div>
-    ${s.you.isHost ? `<div class="btn-row">
-      <button class="btn btn-ghost" id="next-speaker" type="button">Next speaker</button>
-      <button class="btn" id="advance" type="button">Start vote</button>
-    </div>
-    ${hostEndButton(s)}` : `<p class="hint">Listen for your name in the speaking order.</p>`}
+    ${s.you.isHost ? `
+      ${atEnd ? `<div class="btn-row">
+        <button class="btn" id="around-again" type="button">Go around again</button>
+        <button class="btn btn-ghost" id="advance" type="button">Open the floor</button>
+      </div>` : `<div class="btn-row">
+        <button class="btn" id="next-speaker" type="button">Next speaker</button>
+        <button class="btn btn-ghost" id="advance" type="button">Open the floor</button>
+      </div>`}
+      ${hostEndButton(s)}
+    ` : `<p class="hint">${yourTurn ? "Give a clue without naming it." : "Listen for your name in the speaking order."}</p>`}
   </section>`;
   bindNextPrompt();
   const next = app.querySelector("#next-speaker");
   if (next) next.onclick = () => act(() => api("/api/room/next-speaker", { method: "POST" }));
+  const around = app.querySelector("#around-again");
+  if (around) around.onclick = () => act(() => api("/api/room/around-again", { method: "POST" }));
   const advance = app.querySelector("#advance");
   if (advance) advance.onclick = () => act(() => api("/api/room/advance", { method: "POST" }));
   bindEndGame();
+}
+
+function renderHuddle() {
+  const s = state.snapshot;
+  const ms = remainingMs(s);
+  const total = (s.discussSeconds || 0) * 1000;
+  const pct = ms == null || !total ? 100 : Math.max(0, Math.round((ms / total) * 100));
+  const role = s.you.role;
+  app.innerHTML = `<section class="screen stack-lg">
+    ${toast()}
+    <div>
+      <div class="kicker">Open floor</div>
+      <h2>Talk it out</h2>
+      <p class="lede">No speaking order. Accuse, defend, or stay quiet. Next, imposters get one guess at the word.</p>
+    </div>
+    ${ms != null ? `<div class="timer${ms < 15000 ? " warn" : ""}">${formatMs(ms)}</div><div class="bar"><span style="--p:${pct}%"></span></div>` : `<p class="hint">No timer — host decides when guessing starts.</p>`}
+    ${promptCard(s, { hostSwap: true })}
+    ${role?.kind === "imposter" && !role.clue ? `<p class="hint">You still do not know the word. Listen, then guess.</p>` : ""}
+    ${s.you.isHost ? `<div class="footer-actions">
+      <button class="btn" id="advance" type="button">${s.passAndPlay ? "Start vote" : "Time to guess"}</button>
+      ${hostEndButton(s)}
+    </div>` : `<p class="hint">Waiting on ${esc(s.players.find((p) => p.isHost)?.name || "the host")}.</p>`}
+  </section>`;
+  const advance = app.querySelector("#advance");
+  if (advance) advance.onclick = () => act(() => api("/api/room/advance", { method: "POST" }));
+  bindNextPrompt();
+  bindEndGame();
+}
+
+function renderGuess() {
+  const s = state.snapshot;
+  const you = s.you;
+  let body = "";
+  if (you.sittingOut) {
+    body = `<div class="waiting">This round already started. You are in for the next one.</div>`;
+  } else if (you.canGuess) {
+    body = `
+      <p class="lede">One shot. If you name it, imposters win the round. A miss just goes to a vote — nobody else sees what you typed.</p>
+      <form id="guess-form" class="stack">
+        <label>Your guess
+          <input name="guess" maxlength="48" placeholder="The word" autocomplete="off" autocapitalize="off" />
+        </label>
+        <button class="btn" type="submit"${state.busy ? " disabled" : ""}>Guess the word</button>
+        <button class="btn btn-ghost" id="skip-guess" type="button">Skip — I am not sure</button>
+      </form>`;
+  } else if (you.guessMissed) {
+    body = `<div class="waiting">Not the word. Keep a straight face. The table will vote next.</div>`;
+  } else if (you.hasGuessed) {
+    body = `<div class="waiting">Guess locked in. Waiting on the others.</div>`;
+  } else {
+    body = `<div class="waiting">
+      <div class="kicker">Stay quiet</div>
+      <h2>Imposters are guessing</h2>
+      <p>Do not react. They get one private shot at the word before you vote.</p>
+    </div>`;
+  }
+  app.innerHTML = `<section class="screen stack-lg">
+    ${toast()}
+    <div>
+      <div class="kicker">Guess</div>
+      <h2>${you.canGuess ? "Name the word" : "One shot"}</h2>
+    </div>
+    ${body}
+    ${s.you.isHost ? `<div class="footer-actions">
+      <button class="btn btn-ghost" id="advance" type="button">Close guesses — vote</button>
+      ${hostEndButton(s)}
+    </div>` : ""}
+  </section>`;
+  const form = app.querySelector("#guess-form");
+  if (form) form.onsubmit = (event) => {
+    event.preventDefault();
+    const word = form.querySelector("[name=guess]").value.trim();
+    if (!word) return;
+    state.drafts.guess = "";
+    act(() => api("/api/room/guess", { method: "POST", body: { word } }));
+  };
+  const skip = app.querySelector("#skip-guess");
+  if (skip) skip.onclick = () => {
+    state.drafts.guess = "";
+    act(() => api("/api/room/guess", { method: "POST", body: { word: null } }));
+  };
+  const advance = app.querySelector("#advance");
+  if (advance) advance.onclick = () => act(() => api("/api/room/advance", { method: "POST" }));
+  bindEndGame();
+  restoreDrafts();
 }
 
 function renderVote() {
@@ -852,6 +1007,7 @@ function renderVote() {
       <h2>Who is the imposter?</h2>
       <p class="lede">${s.you.hasVoted ? "Locked in. Waiting on the table." : "You cannot vote for yourself. Skip if you truly have no read."}</p>
     </div>
+    ${s.you.role?.kind === "imposter" && s.you.role.clue ? `<p class="hint">Category: ${esc(s.you.role.clue)}. Keep a straight face.</p>` : ""}
     <div class="vote-grid">
       ${others.map((p) => `<button class="vote-btn${s.you.votedFor === p.id ? " picked" : ""}" data-vote="${p.id}" ${s.you.hasVoted ? "disabled" : ""}>${esc(p.name)}</button>`).join("")}
       <button class="vote-btn${s.you.hasVoted && s.you.votedFor == null ? " picked" : ""}" data-vote="" ${s.you.hasVoted ? "disabled" : ""}>Skip — not sure</button>
@@ -881,27 +1037,43 @@ function renderResults() {
   const s = state.snapshot;
   const result = s.result || {};
   const townWon = result.winner === "faithfuls";
+  const guessed = result.winReason === "guess";
   const imposters = s.players.filter((p) => result.imposterIds?.includes(p.id));
   const eliminated = s.players.filter((p) => result.eliminatedIds?.includes(p.id));
+  const guesser = s.players.find((p) => p.id === result.guessedBy);
+  const headline = guessed
+    ? "They named the word."
+    : townWon
+      ? "Caught them."
+      : "They got away.";
+  const named = guessed
+    ? (guesser ? `${esc(guesser.name)} guessed it.` : "An imposter guessed it.")
+    : eliminated.length === 1
+      ? `The table named ${esc(eliminated[0].name)}.`
+      : eliminated.length > 1
+        ? "The vote tied — imposters slip through."
+        : "Nobody was named.";
   app.innerHTML = `<section class="screen stack-lg">
     ${toast()}
     <div class="banner ${townWon ? "win" : "lose"}">
       <div class="kicker">${townWon ? "Faithfuls" : "Imposters"}</div>
-      <h2>${townWon ? "Caught them." : "They got away."}</h2>
+      <h2>${headline}</h2>
       <p>The word was <strong>${esc(result.word)}</strong></p>
       ${s.prompt ? `<p class="muted">${s.prompt.kind === "do" ? "Action" : "Question"}: ${esc(s.prompt.text)}</p>` : ""}
     </div>
     <div class="panel stack">
       <h3>Imposter${imposters.length === 1 ? "" : "s"}</h3>
       ${imposters.map((p) => playerRow(p, s.you.id, result.clue ? ` · ${esc(result.clue)}` : "")).join("")}
-      <p class="muted">${eliminated.length === 1 ? `The table named ${esc(eliminated[0].name)}.` : eliminated.length > 1 ? "The vote tied — imposters slip through." : "Nobody was named."}</p>
+      <p class="muted">${named}</p>
     </div>
     <div class="panel stack">
       <h3>Scoreboard</h3>
       <div class="player-list">
         ${s.players.map((p) => {
           const delta = p.scoreDelta ? ` · +${p.scoreDelta}` : "";
-          const vote = p.inRound ? ` · voted ${esc(voteLabel(s, p.votedFor))}` : " · sat out";
+          const vote = guessed
+            ? ""
+            : p.inRound ? ` · voted ${esc(voteLabel(s, p.votedFor))}` : " · sat out";
           return playerRow(p, s.you.id, `${delta}${vote}`);
         }).join("")}
       </div>
@@ -949,7 +1121,7 @@ function renderEnded() {
 }
 
 function render() {
-  if (state.snapshot && state.snapshot.phase === "lobby") captureDrafts();
+  if (state.snapshot && (state.snapshot.phase === "lobby" || state.snapshot.phase === "guess")) captureDrafts();
   const s = state.snapshot;
   if (!s) {
     renderHome();
@@ -961,6 +1133,8 @@ function render() {
     restoreDrafts();
   } else if (phase === "reveal") renderReveal();
   else if (phase === "discuss") renderDiscuss();
+  else if (phase === "huddle") renderHuddle();
+  else if (phase === "guess") renderGuess();
   else if (phase === "vote") renderVote();
   else if (phase === "results") renderResults();
   else if (phase === "ended") renderEnded();
@@ -974,7 +1148,7 @@ function tickTimers() {
   clearInterval(timerId);
   timerId = setInterval(() => {
     const snap = state.snapshot;
-    if (snap?.phase !== "discuss" || !snap.discussEndsAt) return;
+    if (snap?.phase !== "huddle" || !snap.discussEndsAt) return;
     const ms = remainingMs(snap);
     if (ms === 0) {
       refresh();
@@ -1001,34 +1175,43 @@ function startPolling() {
 }
 
 async function boot() {
-  state.joinCode = joinCodeFromLocation();
+  state.joinCode = joinCodeFromLocation() || state.joinCode || localStorage.getItem("imposter.room") || "";
   state.inviteToken = inviteTokenFromLocation();
   await loadMeta();
   if (state.inviteToken && !state.token) {
     try {
       const info = await api(`/api/invites/${encodeURIComponent(state.inviteToken)}`);
       state.name = info.name;
-      state.joinCode = info.code;
       localStorage.setItem("imposter.name", info.name);
+      rememberTable(info.code);
       const result = await api("/api/rooms/join", {
         method: "POST",
         body: { name: info.name, code: info.code, inviteToken: state.inviteToken },
       });
       setToken(result.token);
       state.snapshot = result.room;
+      rememberSnapshot(result.room);
       history.replaceState({}, "", `/join/${info.code}`);
     } catch (err) {
-      setError(err);
+      try {
+        if (!(await reclaimSeat())) setError(err);
+      } catch (reclaimErr) {
+        setError(reclaimErr);
+      }
     }
   }
-  if (state.token) await refresh();
-  else render();
+  if (!state.snapshot && state.token) await refresh();
+  render();
   startPolling();
   tickTimers();
 }
 
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") refresh();
+});
+
+window.addEventListener("pageshow", () => {
+  if (state.token) refresh();
 });
 
 boot();

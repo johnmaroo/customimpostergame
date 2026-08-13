@@ -144,6 +144,14 @@ class ServerApiTests(unittest.TestCase):
         self.assertNotEqual(swapped.json()["prompt"]["id"], discuss["prompt"]["id"])
 
         self.client.post("/api/room/advance", headers=auth(host["token"]))
+        huddle = self.client.get("/api/room", headers=auth(host["token"])).json()
+        self.assertEqual(huddle["phase"], "huddle")
+
+        self.client.post("/api/room/advance", headers=auth(host["token"]))
+        guess = self.client.get("/api/room", headers=auth(host["token"])).json()
+        self.assertEqual(guess["phase"], "guess")
+
+        self.client.post("/api/room/advance", headers=auth(host["token"]))
         vote_state = self.client.get("/api/room", headers=auth(host["token"])).json()
         self.assertEqual(vote_state["phase"], "vote")
         target = next(p["id"] for p in vote_state["players"] if p["id"] != host["playerId"])
@@ -221,6 +229,26 @@ class ServerApiTests(unittest.TestCase):
                 self.assertIsNone(view["you"]["role"]["clue"])
             else:
                 self.assertEqual(view["you"]["role"]["word"], "Toaster")
+
+    def test_same_name_rejoins_after_session_drop(self) -> None:
+        host = self.client.post("/api/rooms", json={"name": "Host"}).json()
+        code = host["room"]["code"]
+        ava = self.client.post("/api/rooms/join", json={"name": "Ava", "code": code}).json()
+        old_token = ava["token"]
+        player_id = ava["playerId"]
+        again = self.client.post("/api/rooms/join", json={"name": "Ava", "code": code})
+        self.assertEqual(again.status_code, 200)
+        self.assertEqual(again.json()["playerId"], player_id)
+        self.assertNotEqual(again.json()["token"], old_token)
+        stale = self.client.get("/api/room", headers={"Authorization": f"Bearer {old_token}"})
+        self.assertEqual(stale.status_code, 401)
+        fresh = self.client.get(
+            "/api/room",
+            headers={"Authorization": f"Bearer {again.json()['token']}"},
+        )
+        self.assertEqual(fresh.status_code, 200)
+        self.assertEqual(fresh.json()["you"]["name"], "Ava")
+        self.assertEqual(fresh.json()["code"], code)
 
 
 if __name__ == "__main__":

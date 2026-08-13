@@ -1,8 +1,11 @@
+import os
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from wordbank import WordBank
+from wordbank import TMP_DB_PATH, WordBank, default_db_path
 
 
 class WordBankTests(unittest.TestCase):
@@ -57,6 +60,32 @@ class WordBankTests(unittest.TestCase):
         self.assertTrue(self.bank.remove_word("Banana"))
         self.assertEqual(self.bank.all_words(), ["mango"])
         self.assertFalse(self.bank.remove_word("missing"))
+
+    def test_default_db_path_uses_tmp_on_vercel(self) -> None:
+        with patch.dict(os.environ, {"VERCEL": "1"}, clear=False):
+            os.environ.pop("IMPOSTER_DB_PATH", None)
+            self.assertEqual(default_db_path(), Path("/tmp/imposter-wordbank.db"))
+        with patch.dict(os.environ, {"IMPOSTER_DB_PATH": "/tmp/custom.db"}, clear=False):
+            self.assertEqual(default_db_path(), Path("/tmp/custom.db"))
+
+    def test_wordbank_falls_back_to_tmp_when_open_fails(self) -> None:
+        real_open = WordBank._open
+
+        def gated(self):
+            if self.db_path == Path("/var/task/wordbank.db"):
+                raise sqlite3.OperationalError("attempt to write a readonly database")
+            return real_open(self)
+
+        with patch("wordbank.default_db_path", return_value=Path("/var/task/wordbank.db")):
+            with patch.object(WordBank, "_open", gated):
+                bank = WordBank()
+        try:
+            self.assertEqual(bank.db_path, TMP_DB_PATH)
+            self.assertTrue(bank.add_word("oak"))
+        finally:
+            bank.close()
+            if TMP_DB_PATH.exists():
+                TMP_DB_PATH.unlink()
 
 
 if __name__ == "__main__":

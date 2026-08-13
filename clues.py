@@ -90,9 +90,10 @@ def generate_category_clue(
             "role": "system",
             "content": (
                 "You write category clues for the party game Imposter. "
-                "Reply with a short category the secret word belongs to, "
+                "Reply with a broad, everyday category — the general kind of thing it is. "
+                "Keep it wide enough that several different secrets could fit, "
                 "so an imposter can talk around the topic without knowing the word. "
-                "Do not include the secret word itself."
+                "Do not include the secret word itself, and do not add a giveaway detail."
             ),
         },
         {"role": "user", "content": f"Secret word: {cleaned}"},

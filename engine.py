@@ -14,16 +14,20 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from prompts import IRL_MODES, pick_prompt, prompt_view
+
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ"
 MIN_PLAYERS = 3
 MAX_NAME_LEN = 24
 MAX_WORD_LEN = 48
 MAX_WORDS_PER_ROOM = 200
 ROOM_IDLE_SECONDS = 4 * 60 * 60
+USED_PROMPT_CAP = 20
 
 Phase = Literal["lobby", "reveal", "discuss", "huddle", "guess", "vote", "results", "ended"]
 Winner = Literal["faithfuls", "imposters"]
 WinReason = Literal["guess", "vote"]
+IrlMode = Literal["off", "mix", "ask", "do"]
 
 
 class GameError(Exception):
@@ -59,6 +63,72 @@ def _normalize_guess(text: str) -> str:
         else:
             pieces.append(" ")
     return " ".join("".join(pieces).split())
+
+
+def _sample_by_fewest(
+    rng: random.Random,
+    player_ids: list[str],
+    counts: dict[str, int],
+    k: int,
+    avoid: list[str] | None = None,
+) -> list[str]:
+    """Pick k players, filling from those chosen the fewest times.
+
+    Within a count bucket, recently chosen ids are skipped when enough
+    other people are tied with them. That keeps deals random among the
+    people who are due, without locking in a fixed rotation.
+    """
+    if k < 0 or k > len(player_ids):
+        raise ValueError("cannot sample that many players")
+    avoid_set = set(avoid or [])
+    remaining = list(player_ids)
+    picked: list[str] = []
+    while len(picked) < k:
+        min_c = min(counts.get(pid, 0) for pid in remaining)
+        pool = [pid for pid in remaining if counts.get(pid, 0) == min_c]
+        preferred = [pid for pid in pool if pid not in avoid_set]
+        use = preferred if preferred else pool
+        take = min(k - len(picked), len(use))
+        chosen = rng.sample(use, take)
+        picked.extend(chosen)
+        chosen_set = set(chosen)
+        remaining = [pid for pid in remaining if pid not in chosen_set]
+    return picked
+
+
+def _shuffled_copy(
+    rng: random.Random,
+    items: list[str],
+    *,
+    unlike: list[str] | None = None,
+) -> list[str]:
+    items = list(items)
+    if len(items) <= 1:
+        return items
+    result = list(items)
+    for _ in range(12):
+        rng.shuffle(items)
+        if unlike is None or items != unlike:
+            return list(items)
+        result = list(items)
+    return result
+
+
+def _deal_speaking_order(
+    rng: random.Random,
+    player_ids: list[str],
+    starter_counts: dict[str, int],
+    previous: list[str] | None,
+    last_starter: str | None,
+) -> list[str]:
+    ids = list(player_ids)
+    avoid = [last_starter] if last_starter else []
+    starter = _sample_by_fewest(rng, ids, starter_counts, 1, avoid=avoid)[0]
+    rest = [pid for pid in ids if pid != starter]
+    unlike = None
+    if previous and previous[:1] == [starter] and set(previous[1:]) == set(rest):
+        unlike = previous[1:]
+    return [starter] + _shuffled_copy(rng, rest, unlike=unlike)
 
 
 def _new_id() -> str:
@@ -108,6 +178,7 @@ class RoundState:
     eliminated_ids: list[str] = field(default_factory=list)
     score_delta: dict[str, int] = field(default_factory=dict)
     vote_counts: dict[str, int] = field(default_factory=dict)
+    prompt: dict[str, str] | None = None
 
 
 @dataclass
@@ -120,12 +191,20 @@ class Room:
     discuss_seconds: int = 90
     pass_and_play: bool = False
     words_visible: bool = False
+    irl_mode: IrlMode = "mix"
+    imposter_hints: bool = True
     phase: Phase = "lobby"
     round: RoundState | None = None
     round_number: int = 0
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     invites: dict[str, Invite] = field(default_factory=dict)
+    word_sources: dict[str, str] = field(default_factory=dict)
+    used_prompt_ids: list[str] = field(default_factory=list)
+    imposter_counts: dict[str, int] = field(default_factory=dict)
+    starter_counts: dict[str, int] = field(default_factory=dict)
+    last_imposter_ids: list[str] = field(default_factory=list)
+    last_speaking_order: list[str] = field(default_factory=list)
 
 
 class GameHub:
@@ -133,7 +212,7 @@ class GameHub:
         self.rooms: dict[str, Room] = {}
         self.token_index: dict[str, tuple[str, str]] = {}
         self.invite_index: dict[str, str] = {}
-        self.rng = rng or random.Random()
+        self.rng = rng if rng is not None else random.SystemRandom()
 
     def create_room(self, host_name: str) -> tuple[Room, Player]:
         name = _clean_name(host_name)
@@ -264,6 +343,8 @@ class GameHub:
         discuss_seconds: int | None = None,
         pass_and_play: bool | None = None,
         words_visible: bool | None = None,
+        irl_mode: str | None = None,
+        imposter_hints: bool | None = None,
     ) -> None:
         self._require_host(host)
         if room.phase not in ("lobby", "results"):
@@ -280,15 +361,25 @@ class GameHub:
             room.pass_and_play = bool(pass_and_play)
         if words_visible is not None:
             room.words_visible = bool(words_visible)
+        if irl_mode is not None:
+            cleaned_mode = irl_mode.strip().lower()
+            if cleaned_mode not in IRL_MODES:
+                raise GameError("Pick an IRL turn style from the list.")
+            room.irl_mode = cleaned_mode  # type: ignore[assignment]
+        if imposter_hints is not None:
+            room.imposter_hints = bool(imposter_hints)
         self._touch(room)
 
-    def add_word(self, room: Room, host: Player, word: str) -> str:
-        self._require_host(host)
+    def add_word(self, room: Room, player: Player, word: str, *, source: str | None = None) -> str:
+        if room.phase not in ("lobby", "results"):
+            raise GameError("Add words between rounds.")
         cleaned = _clean_word(word)
         if len(room.remaining_words) + len(room.used_words) >= MAX_WORDS_PER_ROOM:
             raise GameError("Word bank is full.")
         already = {item.casefold() for item in room.remaining_words + room.used_words}
         if cleaned.casefold() in already:
+            if source:
+                room.word_sources.setdefault(cleaned.casefold(), source)
             if cleaned.casefold() in {item.casefold() for item in room.remaining_words}:
                 return cleaned
             room.used_words = [w for w in room.used_words if w.casefold() != cleaned.casefold()]
@@ -296,10 +387,13 @@ class GameHub:
             self._touch(room)
             return cleaned
         room.remaining_words.append(cleaned)
+        if source:
+            room.word_sources[cleaned.casefold()] = source
         self._touch(room)
         return cleaned
 
     def add_words(self, room: Room, host: Player, words: list[str]) -> list[str]:
+        self._require_host(host)
         added: list[str] = []
         for word in words:
             added.append(self.add_word(room, host, word))
@@ -315,6 +409,7 @@ class GameHub:
         room.used_words = [w for w in room.used_words if w.casefold() != target.casefold()]
         if len(room.remaining_words) + len(room.used_words) == before:
             raise GameError("That word is not in this game.")
+        room.word_sources.pop(target.casefold(), None)
         self._touch(room)
 
     def recycle_words(self, room: Room, host: Player) -> int:
@@ -346,9 +441,29 @@ class GameHub:
 
         word = room.remaining_words.pop(self.rng.randrange(len(room.remaining_words)))
         room.used_words.append(word)
-        imposters = [p.id for p in self.rng.sample(seated, room.num_imposters)]
-        order = [p.id for p in seated]
-        self.rng.shuffle(order)
+        seated_ids = [p.id for p in seated]
+        imposters = _sample_by_fewest(
+            self.rng,
+            seated_ids,
+            room.imposter_counts,
+            room.num_imposters,
+            avoid=room.last_imposter_ids,
+        )
+        self.rng.shuffle(imposters)
+        previous_order = room.last_speaking_order or seated_ids
+        last_starter = room.last_speaking_order[0] if room.last_speaking_order else None
+        order = _deal_speaking_order(
+            self.rng,
+            seated_ids,
+            room.starter_counts,
+            previous=previous_order,
+            last_starter=last_starter,
+        )
+        for pid in imposters:
+            room.imposter_counts[pid] = room.imposter_counts.get(pid, 0) + 1
+        room.starter_counts[order[0]] = room.starter_counts.get(order[0], 0) + 1
+        room.last_imposter_ids = list(imposters)
+        room.last_speaking_order = list(order)
         clock = time.time() if now is None else now
         round_state = RoundState(
             word=word,
@@ -356,6 +471,7 @@ class GameHub:
             imposter_ids=imposters,
             participant_ids=[p.id for p in seated],
             speaking_order=order,
+            prompt=self._deal_prompt(room, word),
         )
         room.round = round_state
         room.round_number += 1
@@ -439,6 +555,21 @@ class GameHub:
         seated = self._seated_imposters(room)
         if seated and all(pid in rnd.guesses for pid in seated):
             self._enter_vote(room)
+
+    def next_prompt(self, room: Room, host: Player) -> dict[str, str] | None:
+        """Host swaps the shared IRL prompt during reveal, the circle, or open floor."""
+        self._require_host(host)
+        self.tick(room)
+        if room.phase not in ("reveal", "discuss", "huddle") or room.round is None:
+            raise GameError("IRL prompts can change during reveal or discussion.")
+        if room.irl_mode == "off":
+            raise GameError("Turn on IRL turns to deal a prompt.")
+        prompt = self._deal_prompt(room, room.round.word, extra_exclude={
+            room.round.prompt["id"] if room.round.prompt else ""
+        })
+        room.round.prompt = prompt
+        self._touch(room)
+        return prompt
 
     def advance(self, room: Room, host: Player, *, now: float | None = None) -> None:
         """Host skips ahead: reveal → discuss → huddle → guess → vote → results."""
@@ -552,6 +683,9 @@ class GameHub:
             "discussSeconds": room.discuss_seconds,
             "passAndPlay": room.pass_and_play,
             "wordsVisible": room.words_visible and player.is_host,
+            "irlMode": room.irl_mode,
+            "imposterHints": room.imposter_hints,
+            "prompt": rnd.prompt if rnd else None,
             "remainingWordCount": len(room.remaining_words),
             "usedWordCount": len(room.used_words),
             "canStart": self._can_start(room),
@@ -602,6 +736,28 @@ class GameHub:
                 self.token_index.pop(player.token, None)
             for token in room.invites:
                 self.invite_index.pop(token, None)
+
+    def _deal_prompt(
+        self,
+        room: Room,
+        word: str,
+        *,
+        extra_exclude: set[str] | None = None,
+    ) -> dict[str, str] | None:
+        blocked = [pid for pid in room.used_prompt_ids if pid]
+        if extra_exclude:
+            blocked.extend(item for item in extra_exclude if item)
+        picked = pick_prompt(
+            self.rng,
+            mode=room.irl_mode,
+            pack_id=room.word_sources.get(word.casefold()),
+            exclude=blocked,
+        )
+        view = prompt_view(picked)
+        if view:
+            room.used_prompt_ids.append(view["id"])
+            room.used_prompt_ids = room.used_prompt_ids[-USED_PROMPT_CAP:]
+        return view
 
     def _enter_discuss(self, room: Room, now: float | None = None) -> None:
         if room.round is None:
@@ -702,6 +858,8 @@ class GameHub:
     def _remove_player(self, room: Room, player: Player) -> None:
         room.players.pop(player.id, None)
         self.token_index.pop(player.token, None)
+        room.imposter_counts.pop(player.id, None)
+        room.starter_counts.pop(player.id, None)
         if player.is_host and room.players:
             successor = next(iter(room.players.values()))
             successor.is_host = True
@@ -731,13 +889,10 @@ class GameHub:
 
     def _role_payload(self, room: Room, rnd: RoundState, player_id: str, name: str) -> dict[str, Any]:
         if player_id in rnd.imposter_ids:
-            show_clue = bool(
-                rnd.clue
-                and (
-                    room.pass_and_play
-                    or rnd.clue_unlocked
-                    or room.phase in ("results", "ended")
-                )
+            delayed_ok = room.pass_and_play or rnd.clue_unlocked
+            show_clue = bool(rnd.clue) and (
+                room.phase in ("results", "ended")
+                or (room.imposter_hints and delayed_ok)
             )
             return {
                 "kind": "imposter",

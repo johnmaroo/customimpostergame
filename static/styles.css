@@ -395,6 +395,32 @@ input:focus, select:focus {
   background: rgba(232, 195, 122, 0.08);
 }
 
+.prompt-card {
+  padding: 18px 16px;
+  border-radius: 20px;
+  text-align: center;
+  display: grid;
+  gap: 8px;
+  justify-items: center;
+}
+
+.prompt-card p {
+  font-size: 1.12rem;
+  line-height: 1.35;
+  max-width: 28ch;
+}
+
+.prompt-card.ask {
+  background: rgba(232, 195, 122, 0.1);
+  border: 1px solid rgba(232, 195, 122, 0.35);
+}
+
+.prompt-card.do {
+  background: rgba(255, 93, 115, 0.1);
+  border: 1px solid rgba(255, 93, 115, 0.32);
+}
+
+.prompt-card .btn-small { margin-top: 4px; }
 .speaker strong {
   display: block;
   font-size: 1.4rem;

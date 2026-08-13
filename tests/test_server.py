@@ -222,6 +222,26 @@ class ServerApiTests(unittest.TestCase):
             else:
                 self.assertEqual(view["you"]["role"]["word"], "Toaster")
 
+    def test_same_name_rejoins_after_session_drop(self) -> None:
+        host = self.client.post("/api/rooms", json={"name": "Host"}).json()
+        code = host["room"]["code"]
+        ava = self.client.post("/api/rooms/join", json={"name": "Ava", "code": code}).json()
+        old_token = ava["token"]
+        player_id = ava["playerId"]
+        again = self.client.post("/api/rooms/join", json={"name": "Ava", "code": code})
+        self.assertEqual(again.status_code, 200)
+        self.assertEqual(again.json()["playerId"], player_id)
+        self.assertNotEqual(again.json()["token"], old_token)
+        stale = self.client.get("/api/room", headers={"Authorization": f"Bearer {old_token}"})
+        self.assertEqual(stale.status_code, 401)
+        fresh = self.client.get(
+            "/api/room",
+            headers={"Authorization": f"Bearer {again.json()['token']}"},
+        )
+        self.assertEqual(fresh.status_code, 200)
+        self.assertEqual(fresh.json()["you"]["name"], "Ava")
+        self.assertEqual(fresh.json()["code"], code)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -36,14 +36,22 @@ from notify import (
     sms_url,
 )
 from packs import get_pack, list_packs
-from wordbank import WordBank
+from wordbank import WordBank, default_db_path
 
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
 
 load_env_file()
 
-hub = GameHub()
+
+def _rooms_path() -> Path:
+    override = os.getenv("IMPOSTER_ROOMS_PATH")
+    if override:
+        return Path(override)
+    return default_db_path().with_name("imposter-rooms.json")
+
+
+hub = GameHub(persist_path=_rooms_path())
 bank = WordBank()
 lock = threading.RLock()
 listen_port = 8765

@@ -190,6 +190,42 @@ class GameHubTests(unittest.TestCase):
         with self.assertRaises(GameError):
             self.hub.add_invite(room, host, "Ben", "+15550001111")
 
+    def test_host_can_end_from_lobby_and_reopen(self) -> None:
+        room, host, ava, _ben = self._table()
+        self.hub.end_game(room, host)
+        self.assertEqual(room.phase, "ended")
+        view = self.hub.view_for(room, ava)
+        self.assertEqual(view["phase"], "ended")
+        self.assertIsNone(view.get("result"))
+        with self.assertRaises(GameError) as ctx:
+            self.hub.start_round(room, host)
+        self.assertIn("ended", ctx.exception.message.lower())
+        self.hub.reopen_lobby(room, host)
+        self.assertEqual(room.phase, "lobby")
+        self.assertIsNone(room.round)
+        self.assertIn(ava.id, room.players)
+
+    def test_host_can_end_mid_round_and_reveal_word(self) -> None:
+        room, host, ava, ben = self._table(["Telescope"])
+        rnd = self.hub.start_round(room, host)
+        self.hub.end_game(room, host)
+        self.assertEqual(room.phase, "ended")
+        view = self.hub.view_for(room, ava)
+        self.assertEqual(view["result"]["word"], "Telescope")
+        self.assertEqual(set(view["result"]["imposterIds"]), set(rnd.imposter_ids))
+        self.hub.leave(room, ben)
+        self.assertNotIn(ben.id, room.players)
+
+    def test_non_host_cannot_end_or_reopen(self) -> None:
+        room, host, ava, _ben = self._table()
+        with self.assertRaises(GameError) as ctx:
+            self.hub.end_game(room, ava)
+        self.assertEqual(ctx.exception.status_code, 403)
+        self.hub.end_game(room, host)
+        with self.assertRaises(GameError) as ctx:
+            self.hub.reopen_lobby(room, ava)
+        self.assertEqual(ctx.exception.status_code, 403)
+
     def test_round_deals_shared_irl_prompt(self) -> None:
         room, host, ava, ben = self._table(["Toaster"])
         rnd = self.hub.start_round(room, host)

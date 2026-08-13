@@ -154,6 +154,30 @@ class ServerApiTests(unittest.TestCase):
         )
         self.assertEqual(voted.status_code, 200)
 
+    def test_host_can_end_game_and_reopen(self) -> None:
+        host = self.client.post("/api/rooms", json={"name": "Host"}).json()
+        code = host["room"]["code"]
+        ava = self.client.post("/api/rooms/join", json={"name": "Ava", "code": code}).json()
+        auth = lambda token: {"Authorization": f"Bearer {token}"}
+
+        refused = self.client.post("/api/room/end", headers=auth(ava["token"]))
+        self.assertEqual(refused.status_code, 403)
+
+        ended = self.client.post("/api/room/end", headers=auth(host["token"]))
+        self.assertEqual(ended.status_code, 200)
+        self.assertEqual(ended.json()["phase"], "ended")
+
+        guest = self.client.get("/api/room", headers=auth(ava["token"]))
+        self.assertEqual(guest.status_code, 200)
+        self.assertEqual(guest.json()["phase"], "ended")
+
+        reopened = self.client.post("/api/room/reopen", headers=auth(host["token"]))
+        self.assertEqual(reopened.status_code, 200)
+        self.assertEqual(reopened.json()["phase"], "lobby")
+
+        left = self.client.post("/api/room/leave", headers=auth(ava["token"]))
+        self.assertEqual(left.status_code, 200)
+
     def test_guest_can_add_a_word_in_lobby(self) -> None:
         host = self.client.post("/api/rooms", json={"name": "Host"}).json()
         code = host["room"]["code"]

@@ -24,7 +24,7 @@ MAX_WORDS_PER_ROOM = 200
 ROOM_IDLE_SECONDS = 4 * 60 * 60
 USED_PROMPT_CAP = 20
 
-Phase = Literal["lobby", "reveal", "discuss", "vote", "results"]
+Phase = Literal["lobby", "reveal", "discuss", "vote", "results", "ended"]
 Winner = Literal["faithfuls", "imposters"]
 IrlMode = Literal["off", "mix", "ask", "do"]
 
@@ -290,7 +290,7 @@ class GameHub:
         return room, player
 
     def leave(self, room: Room, player: Player) -> None:
-        if room.phase not in ("lobby", "results") and player.id in self._participants(room):
+        if room.phase not in ("lobby", "results", "ended") and player.id in self._participants(room):
             raise GameError("You can leave between rounds.")
         self._remove_player(room, player)
 
@@ -304,6 +304,19 @@ class GameHub:
         if target.is_host:
             raise GameError("The host cannot be removed.")
         self._remove_player(room, target)
+
+    def end_game(self, room: Room, host: Player) -> None:
+        self._require_host(host)
+        room.phase = "ended"
+        self._touch(room)
+
+    def reopen_lobby(self, room: Room, host: Player) -> None:
+        self._require_host(host)
+        if room.phase != "ended":
+            raise GameError("The game is still going.")
+        room.phase = "lobby"
+        room.round = None
+        self._touch(room)
 
     def set_settings(
         self,
@@ -396,6 +409,8 @@ class GameHub:
     def start_round(self, room: Room, host: Player, *, clue: str | None = None, now: float | None = None) -> RoundState:
         self._require_host(host)
         self.tick(room, now=now)
+        if room.phase == "ended":
+            raise GameError("This game has ended. Play again to start a new round.")
         if room.phase not in ("lobby", "results"):
             raise GameError("A round is already in progress.")
         seated = list(room.players.values())
@@ -564,7 +579,7 @@ class GameHub:
         }
         if rnd and not sitting_out and room.phase in ("reveal", "discuss", "vote"):
             you["role"] = self._role_payload(room, rnd, player.id, player.name)
-        elif rnd and room.phase == "results":
+        elif rnd and room.phase in ("results", "ended"):
             you["role"] = self._role_payload(room, rnd, player.id, player.name)
 
         players = []
@@ -578,7 +593,7 @@ class GameHub:
                 "hasVoted": bool(rnd and p.id in rnd.votes),
                 "inRound": bool(not rnd or p.id in participants),
             }
-            if rnd and room.phase == "results":
+            if rnd and room.phase in ("results", "ended"):
                 entry["wasImposter"] = p.id in rnd.imposter_ids
                 entry["votedFor"] = rnd.votes.get(p.id)
                 entry["scoreDelta"] = rnd.score_delta.get(p.id, 0)
@@ -625,7 +640,7 @@ class GameHub:
                 }
                 for inv in room.invites.values()
             ]
-        if rnd and room.phase == "results":
+        if rnd and room.phase in ("results", "ended"):
             payload["result"] = {
                 "word": rnd.word,
                 "clue": rnd.clue,
@@ -749,7 +764,9 @@ class GameHub:
 
     def _role_payload(self, room: Room, rnd: RoundState, player_id: str, name: str) -> dict[str, Any]:
         if player_id in rnd.imposter_ids:
-            show_clue = bool(rnd.clue) and (room.imposter_hints or room.phase == "results")
+            show_clue = bool(rnd.clue) and (
+                room.imposter_hints or room.phase in ("results", "ended")
+            )
             return {
                 "kind": "imposter",
                 "name": name,

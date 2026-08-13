@@ -478,6 +478,26 @@ def kick(
         return _snapshot(room, player, request)
 
 
+@app.post("/api/room/end")
+def end_game(
+    request: Request, authorization: str | None = Header(default=None)
+) -> dict[str, Any]:
+    with lock:
+        room, player = hub.resolve_token(_token(authorization))
+        hub.end_game(room, player)
+        return _snapshot(room, player, request)
+
+
+@app.post("/api/room/reopen")
+def reopen_lobby(
+    request: Request, authorization: str | None = Header(default=None)
+) -> dict[str, Any]:
+    with lock:
+        room, player = hub.resolve_token(_token(authorization))
+        hub.reopen_lobby(room, player)
+        return _snapshot(room, player, request)
+
+
 @app.post("/api/room/leave")
 def leave(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     with lock:

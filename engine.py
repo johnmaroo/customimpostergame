@@ -267,8 +267,9 @@ class GameHub:
             room.irl_mode = cleaned_mode  # type: ignore[assignment]
         self._touch(room)
 
-    def add_word(self, room: Room, host: Player, word: str, *, source: str | None = None) -> str:
-        self._require_host(host)
+    def add_word(self, room: Room, player: Player, word: str, *, source: str | None = None) -> str:
+        if room.phase not in ("lobby", "results"):
+            raise GameError("Add words between rounds.")
         cleaned = _clean_word(word)
         if len(room.remaining_words) + len(room.used_words) >= MAX_WORDS_PER_ROOM:
             raise GameError("Word bank is full.")
@@ -289,6 +290,7 @@ class GameHub:
         return cleaned
 
     def add_words(self, room: Room, host: Player, words: list[str]) -> list[str]:
+        self._require_host(host)
         added: list[str] = []
         for word in words:
             added.append(self.add_word(room, host, word))

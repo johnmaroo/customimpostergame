@@ -119,6 +119,25 @@ class ServerApiTests(unittest.TestCase):
         )
         self.assertEqual(voted.status_code, 200)
 
+    def test_guest_can_add_a_word_in_lobby(self) -> None:
+        host = self.client.post("/api/rooms", json={"name": "Host"}).json()
+        code = host["room"]["code"]
+        ava = self.client.post("/api/rooms/join", json={"name": "Ava", "code": code}).json()
+        added = self.client.post(
+            "/api/room/words",
+            json={"word": "Waffle"},
+            headers={"Authorization": f"Bearer {ava['token']}"},
+        )
+        self.assertEqual(added.status_code, 200)
+        self.assertEqual(added.json()["remainingWordCount"], 1)
+        packed = self.client.post(
+            "/api/room/words/pack",
+            json={"packId": "food"},
+            headers={"Authorization": f"Bearer {ava['token']}"},
+        )
+        self.assertEqual(packed.status_code, 200)
+        self.assertGreaterEqual(packed.json()["remainingWordCount"], 12)
+
 
 if __name__ == "__main__":
     unittest.main()

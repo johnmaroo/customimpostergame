@@ -263,9 +263,9 @@ function renderHome() {
     ${state.howTo ? `<div class="panel"><ol class="how-list">
       <li>One person creates a room. Everyone else scans the QR on that screen, or gets a text with a join link.</li>
       <li>You can also type the 4-letter code if you already have the site open.</li>
-      <li>The host adds a starter pack or types custom words. Words save for next time.</li>
-      <li>Each player taps a private card: faithfuls see the word, imposters see a category.</li>
-      <li>Take turns on the same IRL question or action — answer it, mime it, or point — without naming the word. Imposters still have to try.</li>
+      <li>Anyone can tap a starter pack or type a custom word. The list stays hidden. Words save for next time.</li>
+      <li>Each player taps a private card: faithfuls see the word, imposters see a broad category.</li>
+      <li>Take turns on the same IRL prompt — a vibe, a reaction, a hot take — without naming the word.</li>
       <li>Vote. If the table names an imposter, the faithfuls score. If not, the imposters do.</li>
     </ol></div>` : ""}
   </section>`;
@@ -348,7 +348,7 @@ function settingsPanel(s) {
         ].map(([v, label]) => `<option value="${v}"${(s.irlMode || "mix") === v ? " selected" : ""}>${label}</option>`).join("")}
       </select>
     </label>
-    <p class="hint">Everyone answers the same prompt. Imposters only have the category, so specifics get slippery.</p>
+    <p class="hint">Same vague prompt for everyone. Talk around the category, not the details.</p>
     <label class="toggle">Pass one phone around
       <input id="pass-play" type="checkbox"${s.passAndPlay ? " checked" : ""} />
     </label>
@@ -359,12 +359,24 @@ function settingsPanel(s) {
 }
 
 function wordPanel(s) {
-  if (!s.you.isHost) {
-    return `<div class="panel"><div class="stat"><b>${s.remainingWordCount}</b><span>words ready</span></div></div>`;
-  }
   const packs = (state.meta?.packs || []).map((pack) =>
     `<button class="chip" type="button" data-pack="${esc(pack.id)}">${esc(pack.title)}</button>`
   ).join("");
+  const addForm = `<form id="add-word" class="row">
+      <input name="word" maxlength="48" placeholder="Add a custom word" autocomplete="off" />
+      <button class="btn btn-small" type="submit">Add</button>
+    </form>
+    <div class="chips">${packs}</div>`;
+  if (!s.you.isHost) {
+    return `<div class="panel stack">
+      <div class="spread">
+        <h3>Word bank</h3>
+        <span class="muted">${s.remainingWordCount} left · ${s.usedWordCount} used</span>
+      </div>
+      ${addForm}
+      <p class="hint">Toss in a word or a pack. Nobody sees the list — not even you.</p>
+    </div>`;
+  }
   const words = (s.words || []).map((word) =>
     `<span class="chip word-chip">${esc(word)}<button type="button" data-remove="${esc(word)}" aria-label="Remove ${esc(word)}">×</button></span>`
   ).join("");
@@ -373,11 +385,7 @@ function wordPanel(s) {
       <h3>Word bank</h3>
       <span class="muted">${s.remainingWordCount} left · ${s.usedWordCount} used</span>
     </div>
-    <form id="add-word" class="row">
-      <input name="word" maxlength="48" placeholder="Add a custom word" autocomplete="off" />
-      <button class="btn btn-small" type="submit">Add</button>
-    </form>
-    <div class="chips">${packs}</div>
+    ${addForm}
     <div class="btn-row">
       <button class="btn btn-ghost btn-small" id="load-saved" type="button">Load saved (${state.meta?.savedWordCount ?? 0})</button>
       <button class="btn btn-ghost btn-small" id="recycle" type="button">Reuse used words</button>
@@ -651,7 +659,7 @@ function renderReveal() {
   return `<div class="prompt-card ${prompt.kind === "do" ? "do" : "ask"}">
     <div class="kicker">${kind} · everyone</div>
     <p>${esc(prompt.text)}</p>
-    <p class="muted">Same prompt for the whole table. Do not name the word.</p>
+    <p class="muted">Keep it vague. Don't name the word.</p>
     ${swap}
   </div>`;
 }
@@ -683,7 +691,7 @@ function renderDiscuss() {
     ? (s.prompt.kind === "do" ? "Do this" : "Answer this")
     : "Talk around the word";
   const lede = s.prompt
-    ? "Then keep talking around the word. Imposters should still sound like they belong."
+    ? "Keep it vague. Imposters only have a broad category."
     : "Do not say it. Imposters should still sound like they belong.";
   app.innerHTML = `<section class="screen stack-lg">
     ${toast()}

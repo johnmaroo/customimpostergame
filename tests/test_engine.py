@@ -222,24 +222,23 @@ class GameHubTests(unittest.TestCase):
         self.assertNotEqual(swapped["id"], first)
         self.assertEqual(room.round.prompt["id"], swapped["id"])
 
-    def test_pack_word_can_draw_pack_prompt(self) -> None:
-        from prompts import eligible_prompts
+    def test_guest_can_add_words_in_lobby(self) -> None:
+        room, _host, ava, _ben = self._table(["Toaster"])
+        added = self.hub.add_word(room, ava, "Waffle")
+        self.assertEqual(added, "Waffle")
+        self.assertIn("Waffle", room.remaining_words)
 
-        room, host, _ava, _ben = self._table()
-        self.hub.add_word(room, host, "Penguin", source="animals")
-        self.hub.set_settings(room, host, irl_mode="do")
-        pack_ids = {prompt["id"] for prompt in eligible_prompts("do", "animals") if prompt["packs"]}
-        seen: set[str] = set()
-        for _ in range(40):
-            room.remaining_words = ["Penguin"]
-            room.used_words = []
-            room.phase = "lobby"
-            room.round = None
-            rnd = self.hub.start_round(room, host)
-            seen.add(rnd.prompt["id"])
-            if seen & pack_ids:
-                break
-        self.assertTrue(seen & pack_ids)
+    def test_guest_cannot_add_words_during_a_round(self) -> None:
+        room, host, ava, _ben = self._table(["Toaster"])
+        self.hub.start_round(room, host)
+        with self.assertRaises(GameError):
+            self.hub.add_word(room, ava, "Waffle")
+
+    def test_guest_cannot_load_saved_words(self) -> None:
+        room, _host, ava, _ben = self._table(["Toaster"])
+        with self.assertRaises(GameError) as ctx:
+            self.hub.add_words(room, ava, ["Secret"])
+        self.assertEqual(ctx.exception.status_code, 403)
 
     def test_invalid_irl_mode_rejected(self) -> None:
         room, host, _ava, _ben = self._table()

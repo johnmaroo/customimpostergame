@@ -1,8 +1,8 @@
 """Shared IRL questions and actions for Imposter discussion turns.
 
 Everyone at the table sees the same prompt, so answers can be compared.
-Prompts are written to work if you know the secret word or only a category:
-they never name a specific word, and they stay seated-table safe.
+Prompts stay vague on purpose: opinion and vibe, not facts about the secret.
+That way an imposter with only a broad category can still take a turn.
 """
 
 from __future__ import annotations
@@ -23,260 +23,113 @@ class Prompt(TypedDict):
 
 
 PROMPTS: tuple[Prompt, ...] = (
-    # Questions — one sentence, comparable around the table.
     {
-        "id": "who-likes",
+        "id": "hot-take",
         "kind": "ask",
-        "text": "Who at this table would like it most? Point at them, then say why in one sentence.",
+        "text": "Hot take, one sentence. Don't name it.",
         "packs": None,
     },
     {
-        "id": "own-borrow-avoid",
+        "id": "recommend",
         "kind": "ask",
-        "text": "Would you rather own it, borrow it, or never deal with it?",
+        "text": "Would you recommend this kind of thing?",
         "packs": None,
     },
     {
-        "id": "useful-fun",
+        "id": "who-into",
         "kind": "ask",
-        "text": "More useful, or more fun?",
-        "packs": None,
-    },
-    {
-        "id": "how-often",
-        "kind": "ask",
-        "text": "Daily, sometimes, or almost never — how often do you run into it?",
-        "packs": None,
-    },
-    {
-        "id": "road-trip",
-        "kind": "ask",
-        "text": "Would you take it on a road trip? Yes, no, or only as a joke.",
-        "packs": None,
-    },
-    {
-        "id": "gift-left",
-        "kind": "ask",
-        "text": "Would you gift this to the person on your left? Why or why not — don't name it.",
-        "packs": None,
-    },
-    {
-        "id": "disappear",
-        "kind": "ask",
-        "text": "If it vanished tomorrow, would you actually notice?",
-        "packs": None,
-    },
-    {
-        "id": "one-word-sense",
-        "kind": "ask",
-        "text": "One word for how it feels, sounds, or smells. Not its name.",
-        "packs": None,
-    },
-    {
-        "id": "last-time",
-        "kind": "ask",
-        "text": "Last time you encountered it — ten seconds. Skip any names.",
-        "packs": None,
-    },
-    {
-        "id": "kids-adults",
-        "kind": "ask",
-        "text": "Kids' thing, adults' thing, or both?",
-        "packs": None,
-    },
-    {
-        "id": "morning-night",
-        "kind": "ask",
-        "text": "Morning energy, night energy, or anytime?",
-        "packs": None,
-    },
-    {
-        "id": "cheap-pricey",
-        "kind": "ask",
-        "text": "Cheap, pricey, or you can't really buy it?",
-        "packs": None,
-    },
-    {
-        "id": "indoor-outdoor",
-        "kind": "ask",
-        "text": "Indoor, outdoor, or both?",
+        "text": "Who here is most into this? Point.",
         "packs": None,
     },
     {
         "id": "overrated",
         "kind": "ask",
-        "text": "What's overrated or underrated about it? Don't name it.",
+        "text": "Overrated, underrated, or about right?",
         "packs": None,
     },
     {
-        "id": "quiet-loud",
+        "id": "one-word",
         "kind": "ask",
-        "text": "Quiet thing, or loud thing?",
+        "text": "One-word reaction. Not its name.",
         "packs": None,
     },
     {
-        "id": "fingers-like",
+        "id": "you-thing",
         "kind": "ask",
-        "text": "Hold up 1–5 fingers for how much you like it, then defend that number.",
+        "text": "Is this a you thing, or not really?",
         "packs": None,
     },
     {
-        "id": "first-look",
+        "id": "vague-story",
         "kind": "ask",
-        "text": "First place you'd look for it? Keep the answer to a kind of place, not a name.",
+        "text": "A short story about it. Keep it vague.",
         "packs": None,
     },
     {
-        "id": "keep-or-toss",
+        "id": "vibe-check",
         "kind": "ask",
-        "text": "If you found this for free, would you keep it, pass it on, or leave it?",
-        "packs": None,
-    },
-    # Actions — short, seated-table safe, no touching other people.
-    {
-        "id": "mime-5",
-        "kind": "do",
-        "text": "Mime encountering it for five seconds. No talking.",
+        "text": "What's the vibe — chill, extra, or meh?",
         "packs": None,
     },
     {
-        "id": "hand-size",
-        "kind": "do",
-        "text": "Show how big it is with your hands.",
+        "id": "more-of-this",
+        "kind": "ask",
+        "text": "Would you want more of this in your life?",
         "packs": None,
     },
     {
-        "id": "point-remind",
-        "kind": "do",
-        "text": "Point at something in the room that reminds you of it. Don't touch it, don't name it.",
+        "id": "table-into",
+        "kind": "ask",
+        "text": "Does this table seem into it?",
         "packs": None,
     },
     {
-        "id": "air-draw",
+        "id": "face",
         "kind": "do",
-        "text": "Draw its shape in the air.",
-        "packs": None,
-    },
-    {
-        "id": "sound",
-        "kind": "do",
-        "text": "Make a sound people associate with it. One shot.",
-        "packs": None,
-    },
-    {
-        "id": "face-vote",
-        "kind": "do",
-        "text": "Show with only your face whether you like it.",
-        "packs": None,
-    },
-    {
-        "id": "pass-imaginary",
-        "kind": "do",
-        "text": "Hand an imaginary version to the person on your right.",
-        "packs": None,
-    },
-    {
-        "id": "find-it",
-        "kind": "do",
-        "text": "Act out how you'd find it or get to it. Five seconds.",
-        "packs": None,
-    },
-    {
-        "id": "commercial",
-        "kind": "do",
-        "text": "Do a three-second commercial. Do not say the name.",
-        "packs": None,
-    },
-    {
-        "id": "pay-hands",
-        "kind": "do",
-        "text": "Raise a hand if you'd pay for it. Cross your arms if you wouldn't.",
-        "packs": None,
-    },
-    {
-        "id": "pretend-photo",
-        "kind": "do",
-        "text": "Pretend to take a photo of it, then react to the picture.",
+        "text": "React with only your face.",
         "packs": None,
     },
     {
         "id": "thumbs",
         "kind": "do",
-        "text": "Thumbs up, sideways, or down — then freeze until the next speaker.",
+        "text": "Thumbs up, sideways, or down.",
         "packs": None,
     },
     {
-        "id": "pose-freeze",
+        "id": "point-who",
         "kind": "do",
-        "text": "Count to three and freeze in a pose that fits it.",
+        "text": "Point at who would be into this.",
         "packs": None,
     },
     {
-        "id": "hum-montage",
+        "id": "vibe-hands",
         "kind": "do",
-        "text": "Hum two seconds of a song you'd put in a montage of it.",
+        "text": "Show the vibe with your hands. Not the thing itself.",
         "packs": None,
     },
-    # Pack-flavored extras. Only dealt when this round's word came from that pack.
     {
-        "id": "house-point-home",
+        "id": "mime-feeling",
         "kind": "do",
-        "text": "Point toward where this would live in a home. If it's actually here, you may point at the real thing.",
-        "packs": ("house",),
+        "text": "Mime how it feels, not what it is.",
+        "packs": None,
     },
     {
-        "id": "house-mime-use",
+        "id": "freeze",
         "kind": "do",
-        "text": "Mime using it the way you actually would at home. No talking.",
-        "packs": ("house",),
+        "text": "Freeze in a reaction to it.",
+        "packs": None,
     },
     {
-        "id": "food-bite",
+        "id": "energy",
         "kind": "do",
-        "text": "Mime a bite or a sip. No flavor names.",
-        "packs": ("food",),
+        "text": "Big energy or small energy — just a gesture.",
+        "packs": None,
     },
     {
-        "id": "food-order-again",
-        "kind": "ask",
-        "text": "Would you order this again? Thumbs up, sideways, or down, then one reason.",
-        "packs": ("food",),
-    },
-    {
-        "id": "places-direction",
+        "id": "pass-vibe",
         "kind": "do",
-        "text": "Point the direction you'd travel to get there. Guessing is allowed.",
-        "packs": ("places",),
-    },
-    {
-        "id": "places-arrive",
-        "kind": "do",
-        "text": "Mime the first thing you'd do when you arrived.",
-        "packs": ("places",),
-    },
-    {
-        "id": "animals-impression",
-        "kind": "do",
-        "text": "Three-second impression. Sound optional.",
-        "packs": ("animals",),
-    },
-    {
-        "id": "animals-move",
-        "kind": "do",
-        "text": "Show how it moves using just your arms.",
-        "packs": ("animals",),
-    },
-    {
-        "id": "party-vibe",
-        "kind": "do",
-        "text": "Act out the vibe: chill, hype, or chaotic.",
-        "packs": ("party",),
-    },
-    {
-        "id": "party-group",
-        "kind": "do",
-        "text": "Mime doing this with a group of friends. Five seconds.",
-        "packs": ("party",),
+        "text": "Send the vibe to the person on your right. No naming.",
+        "packs": None,
     },
 )
 
@@ -309,7 +162,7 @@ def pick_prompt(
     pack_id: str | None = None,
     exclude: list[str] | set[str] | None = None,
 ) -> Prompt | None:
-    """Pick one shared prompt. Pack-tagged prompts only appear for that pack's words."""
+    """Pick one shared prompt. Prompts stay generic so a category still works."""
     if mode == "off":
         return None
     pool = eligible_prompts(mode, pack_id)

@@ -46,14 +46,23 @@ class PromptDeckTests(unittest.TestCase):
             self.assertIsNotNone(prompt)
             self.assertEqual(prompt["kind"], "do")
 
-    def test_pack_prompts_only_when_that_pack_is_in_play(self) -> None:
+    def test_pack_id_does_not_change_generic_deck(self) -> None:
         generic = {prompt["id"] for prompt in eligible_prompts("mix", None)}
         house = {prompt["id"] for prompt in eligible_prompts("mix", "house")}
+        self.assertEqual(generic, house)
         self.assertTrue(generic)
-        self.assertTrue(house - generic)
-        self.assertTrue(all(not p["packs"] or "house" in p["packs"] for p in eligible_prompts("mix", "house")))
-        self.assertNotIn("animals-impression", generic)
-        self.assertIn("animals-impression", {p["id"] for p in eligible_prompts("mix", "animals")})
+
+    def test_pack_fallbacks_stay_broad(self) -> None:
+        from clues import clue_contains_word
+
+        for pack in PACKS.values():
+            clues = {clue for _word, clue in pack["words"]}
+            self.assertLessEqual(len(clues), 1, pack["id"])
+            for word, clue in pack["words"]:
+                self.assertFalse(
+                    clue_contains_word(clue, word),
+                    f"{word!r} leaks into fallback {clue!r}",
+                )
 
     def test_exclude_avoids_recent_ids(self) -> None:
         pool = eligible_prompts("ask", None)

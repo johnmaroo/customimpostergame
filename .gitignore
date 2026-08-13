@@ -7,3 +7,4 @@ wordbank.db
 *.db
 .pytest_cache/
 .DS_Store
+.vercel/

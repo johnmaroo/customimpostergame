@@ -1,15 +1,17 @@
 """Local web server for the Imposter party game.
 
-Run from the repo root:
+Laptop and phones on the same Wi-Fi still use:
 
     python game.py
 
-Then open the printed URL on phones on the same Wi-Fi.
+The existing `static/` UI is also attached with FastAPI's frontend helper so
+the same app can be connected to a Vercel project without replacing LAN play.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import socket
 import threading
 from pathlib import Path
@@ -17,6 +19,7 @@ from typing import Any
 
 from fastapi import FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -47,6 +50,24 @@ listen_port = 8765
 
 app = FastAPI(title="Imposter", docs_url=None, redoc_url=None)
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
+
+
+def _cors_origins() -> list[str]:
+    raw = os.getenv("CORS_ORIGINS", "").strip()
+    if not raw:
+        return []
+    return [part.strip().rstrip("/") for part in raw.split(",") if part.strip()]
+
+
+_cors = _cors_origins()
+if _cors:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 
 class NameBody(BaseModel):
@@ -141,15 +162,26 @@ def lan_ip() -> str:
 
 def public_origin(request: Request) -> str:
     """Origin phones should open. Localhost is rewritten to the LAN address."""
-    host_header = request.headers.get("host") or f"127.0.0.1:{listen_port}"
+    configured = (
+        os.getenv("PUBLIC_ORIGIN") or os.getenv("IMPOSTER_PUBLIC_ORIGIN") or ""
+    ).strip().rstrip("/")
+    if configured:
+        return configured
+    forwarded_host = (request.headers.get("x-forwarded-host") or "").split(",")[0].strip()
+    host_header = forwarded_host or request.headers.get("host") or f"127.0.0.1:{listen_port}"
     hostname, separator, port = host_header.partition(":")
+    proto = (
+        (request.headers.get("x-forwarded-proto") or request.url.scheme or "http")
+        .split(",")[0]
+        .strip()
+    )
     if hostname in {"127.0.0.1", "localhost", "::1", "[::1]"}:
         hostname = lan_ip()
         port = port or str(listen_port)
         return f"http://{hostname}:{port}"
     if not separator:
-        return f"{request.url.scheme}://{host_header}"
-    return f"{request.url.scheme}://{host_header}"
+        return f"{proto}://{host_header}"
+    return f"{proto}://{host_header}"
 
 
 def _snapshot(room, player, request: Request) -> dict[str, Any]:
@@ -437,6 +469,11 @@ def leave(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     return {"ok": True}
 
 
+# Existing phone UI in static/. API routes stay first; Vercel promotes these
+# files to the CDN. python game.py still hosts laptop + phones on Wi-Fi.
+app.frontend("/", directory=str(STATIC), fallback="index.html")
+
+
 def main() -> None:
     global listen_port
     parser = argparse.ArgumentParser(description="Imposter party game")
@@ -449,7 +486,8 @@ def main() -> None:
     print("  --------")
     print(f"  This computer:  http://127.0.0.1:{args.port}")
     print(f"  Phones (Wi-Fi): http://{display_ip}:{args.port}")
-    print("  Friends can scan the QR in the lobby or get a texted join link.\n")
+    print("  Friends can scan the QR in the lobby or get a texted join link.")
+    print("  Vercel is optional extra hosting — LAN play does not need it.\n")
     if not resolve_api_key():
         print("  Tip: add AI_GATEWAY_API_KEY to .env for custom-word category clues.")
         print("  Starter packs still include fallback categories.\n")

@@ -1,8 +1,10 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from wordbank import WordBank
+from wordbank import WordBank, default_db_path
 
 
 class WordBankTests(unittest.TestCase):
@@ -57,6 +59,13 @@ class WordBankTests(unittest.TestCase):
         self.assertTrue(self.bank.remove_word("Banana"))
         self.assertEqual(self.bank.all_words(), ["mango"])
         self.assertFalse(self.bank.remove_word("missing"))
+
+    def test_default_db_path_uses_tmp_on_vercel(self) -> None:
+        with patch.dict(os.environ, {"VERCEL": "1"}, clear=False):
+            os.environ.pop("IMPOSTER_DB_PATH", None)
+            self.assertEqual(default_db_path(), Path("/tmp/imposter-wordbank.db"))
+        with patch.dict(os.environ, {"IMPOSTER_DB_PATH": "/tmp/custom.db"}, clear=False):
+            self.assertEqual(default_db_path(), Path("/tmp/custom.db"))
 
 
 if __name__ == "__main__":

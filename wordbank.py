@@ -2,10 +2,21 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from pathlib import Path
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parent / "wordbank.db"
+
+
+def default_db_path() -> Path:
+    """Local file next to the repo; /tmp on Vercel where the app dir is read-only."""
+    override = os.getenv("IMPOSTER_DB_PATH")
+    if override:
+        return Path(override)
+    if os.getenv("VERCEL"):
+        return Path("/tmp/imposter-wordbank.db")
+    return DEFAULT_DB_PATH
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS words (
@@ -24,8 +35,8 @@ def normalize_word(word: str) -> str:
 
 
 class WordBank:
-    def __init__(self, db_path: str | Path = DEFAULT_DB_PATH):
-        self.db_path = Path(db_path)
+    def __init__(self, db_path: str | Path | None = None):
+        self.db_path = Path(db_path) if db_path is not None else default_db_path()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row

@@ -16,6 +16,41 @@ class ServerApiTests(unittest.TestCase):
         self.assertEqual(res.status_code, 200)
         self.assertIn("Imposter", res.text)
 
+    def test_join_page_and_static_assets(self) -> None:
+        join = self.client.get("/join/KNTQ")
+        self.assertEqual(join.status_code, 200)
+        self.assertIn("Imposter", join.text)
+        css = self.client.get("/static/styles.css")
+        self.assertEqual(css.status_code, 200)
+        js = self.client.get("/static/app.js")
+        self.assertEqual(js.status_code, 200)
+        self.assertIn("function api(", js.text)
+
+    def test_join_url_uses_forwarded_https_host(self) -> None:
+        created = self.client.post(
+            "/api/rooms",
+            json={"name": "Host"},
+            headers={
+                "Host": "imposter.vercel.app",
+                "X-Forwarded-Proto": "https",
+                "X-Forwarded-Host": "imposter.vercel.app",
+            },
+        )
+        self.assertEqual(created.status_code, 200)
+        join_url = created.json()["room"]["joinUrl"]
+        self.assertTrue(join_url.startswith("https://imposter.vercel.app/join/"))
+
+    def test_join_url_uses_public_origin_override(self) -> None:
+        import os
+        from unittest.mock import patch
+
+        with patch.dict(os.environ, {"PUBLIC_ORIGIN": "https://play.example.com"}):
+            created = self.client.post("/api/rooms", json={"name": "Host"})
+        self.assertEqual(created.status_code, 200)
+        self.assertTrue(
+            created.json()["room"]["joinUrl"].startswith("https://play.example.com/join/")
+        )
+
     def test_create_join_and_refuse_short_table(self) -> None:
         created = self.client.post("/api/rooms", json={"name": "Host"})
         self.assertEqual(created.status_code, 200)

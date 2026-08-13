@@ -229,6 +229,14 @@ function playerRow(player, youId, extra = "", actions = "") {
   </div>`;
 }
 
+function seatedInDealOrder(s) {
+  const byId = Object.fromEntries((s.players || []).map((p) => [p.id, p]));
+  if (s.speakingOrder?.length) {
+    return s.speakingOrder.map((p) => byId[p.id]).filter(Boolean);
+  }
+  return (s.players || []).filter((p) => p.inRound);
+}
+
 function renderHome() {
   const code = state.joinCode || joinCodeFromLocation();
   const scanned = Boolean(code);
@@ -562,7 +570,7 @@ function renderReveal() {
       </div>
       ${overlay}
       <div class="vote-grid">
-        ${s.players.filter((p) => p.inRound).map((p) =>
+        ${seatedInDealOrder(s).map((p) =>
           `<button class="vote-btn" data-peek="${p.id}">${esc(p.name)}${p.ready ? " · seen" : ""}</button>`
         ).join("")}
       </div>
@@ -661,7 +669,7 @@ function renderDiscuss() {
 
 function renderVote() {
   const s = state.snapshot;
-  const others = s.players.filter((p) => p.inRound && p.id !== s.you.id);
+  const others = seatedInDealOrder(s).filter((p) => p.id !== s.you.id);
   app.innerHTML = `<section class="screen stack-lg">
     ${toast()}
     <div>

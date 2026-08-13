@@ -50,6 +50,72 @@ def _clean_word(word: str) -> str:
     return cleaned
 
 
+def _sample_by_fewest(
+    rng: random.Random,
+    player_ids: list[str],
+    counts: dict[str, int],
+    k: int,
+    avoid: list[str] | None = None,
+) -> list[str]:
+    """Pick k players, filling from those chosen the fewest times.
+
+    Within a count bucket, recently chosen ids are skipped when enough
+    other people are tied with them. That keeps deals random among the
+    people who are due, without locking in a fixed rotation.
+    """
+    if k < 0 or k > len(player_ids):
+        raise ValueError("cannot sample that many players")
+    avoid_set = set(avoid or [])
+    remaining = list(player_ids)
+    picked: list[str] = []
+    while len(picked) < k:
+        min_c = min(counts.get(pid, 0) for pid in remaining)
+        pool = [pid for pid in remaining if counts.get(pid, 0) == min_c]
+        preferred = [pid for pid in pool if pid not in avoid_set]
+        use = preferred if preferred else pool
+        take = min(k - len(picked), len(use))
+        chosen = rng.sample(use, take)
+        picked.extend(chosen)
+        chosen_set = set(chosen)
+        remaining = [pid for pid in remaining if pid not in chosen_set]
+    return picked
+
+
+def _shuffled_copy(
+    rng: random.Random,
+    items: list[str],
+    *,
+    unlike: list[str] | None = None,
+) -> list[str]:
+    items = list(items)
+    if len(items) <= 1:
+        return items
+    result = list(items)
+    for _ in range(12):
+        rng.shuffle(items)
+        if unlike is None or items != unlike:
+            return list(items)
+        result = list(items)
+    return result
+
+
+def _deal_speaking_order(
+    rng: random.Random,
+    player_ids: list[str],
+    starter_counts: dict[str, int],
+    previous: list[str] | None,
+    last_starter: str | None,
+) -> list[str]:
+    ids = list(player_ids)
+    avoid = [last_starter] if last_starter else []
+    starter = _sample_by_fewest(rng, ids, starter_counts, 1, avoid=avoid)[0]
+    rest = [pid for pid in ids if pid != starter]
+    unlike = None
+    if previous and previous[:1] == [starter] and set(previous[1:]) == set(rest):
+        unlike = previous[1:]
+    return [starter] + _shuffled_copy(rng, rest, unlike=unlike)
+
+
 def _new_id() -> str:
     return secrets.token_urlsafe(9)
 
@@ -110,6 +176,10 @@ class Room:
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     invites: dict[str, Invite] = field(default_factory=dict)
+    imposter_counts: dict[str, int] = field(default_factory=dict)
+    starter_counts: dict[str, int] = field(default_factory=dict)
+    last_imposter_ids: list[str] = field(default_factory=list)
+    last_speaking_order: list[str] = field(default_factory=list)
 
 
 class GameHub:
@@ -117,7 +187,7 @@ class GameHub:
         self.rooms: dict[str, Room] = {}
         self.token_index: dict[str, tuple[str, str]] = {}
         self.invite_index: dict[str, str] = {}
-        self.rng = rng or random.Random()
+        self.rng = rng if rng is not None else random.SystemRandom()
 
     def create_room(self, host_name: str) -> tuple[Room, Player]:
         name = _clean_name(host_name)
@@ -315,9 +385,29 @@ class GameHub:
 
         word = room.remaining_words.pop(self.rng.randrange(len(room.remaining_words)))
         room.used_words.append(word)
-        imposters = [p.id for p in self.rng.sample(seated, room.num_imposters)]
-        order = [p.id for p in seated]
-        self.rng.shuffle(order)
+        seated_ids = [p.id for p in seated]
+        imposters = _sample_by_fewest(
+            self.rng,
+            seated_ids,
+            room.imposter_counts,
+            room.num_imposters,
+            avoid=room.last_imposter_ids,
+        )
+        self.rng.shuffle(imposters)
+        previous_order = room.last_speaking_order or seated_ids
+        last_starter = room.last_speaking_order[0] if room.last_speaking_order else None
+        order = _deal_speaking_order(
+            self.rng,
+            seated_ids,
+            room.starter_counts,
+            previous=previous_order,
+            last_starter=last_starter,
+        )
+        for pid in imposters:
+            room.imposter_counts[pid] = room.imposter_counts.get(pid, 0) + 1
+        room.starter_counts[order[0]] = room.starter_counts.get(order[0], 0) + 1
+        room.last_imposter_ids = list(imposters)
+        room.last_speaking_order = list(order)
         clock = time.time() if now is None else now
         round_state = RoundState(
             word=word,
@@ -568,6 +658,8 @@ class GameHub:
     def _remove_player(self, room: Room, player: Player) -> None:
         room.players.pop(player.id, None)
         self.token_index.pop(player.token, None)
+        room.imposter_counts.pop(player.id, None)
+        room.starter_counts.pop(player.id, None)
         if player.is_host and room.players:
             successor = next(iter(room.players.values()))
             successor.is_host = True

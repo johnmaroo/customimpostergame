@@ -36,6 +36,41 @@ class ServerApiTests(unittest.TestCase):
         self.assertIn("party", ids)
         self.assertIn("house", ids)
 
+    def test_create_room_includes_qr_and_join_url(self) -> None:
+        created = self.client.post("/api/rooms", json={"name": "Host"})
+        room = created.json()["room"]
+        self.assertIn("/join/", room["joinUrl"])
+        self.assertTrue(room["joinQrSvg"].lstrip().startswith("<svg"))
+        self.assertEqual(room["code"] in room["joinUrl"], True)
+
+    def test_phone_invite_and_claim(self) -> None:
+        created = self.client.post("/api/rooms", json={"name": "Host"})
+        token = created.json()["token"]
+        invited = self.client.post(
+            "/api/room/invite",
+            json={"name": "Jordan", "phone": "5551234567"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(invited.status_code, 200)
+        body = invited.json()
+        self.assertIn("smsUrl", body)
+        self.assertTrue(body["smsUrl"].startswith("sms:+15551234567"))
+        invite_token = body["inviteToken"]
+        peeked = self.client.get(f"/api/invites/{invite_token}")
+        self.assertEqual(peeked.status_code, 200)
+        self.assertEqual(peeked.json()["name"], "Jordan")
+        joined = self.client.post(
+            "/api/rooms/join",
+            json={
+                "name": "Jordan",
+                "code": created.json()["room"]["code"],
+                "inviteToken": invite_token,
+            },
+        )
+        self.assertEqual(joined.status_code, 200)
+        reused = self.client.get(f"/api/invites/{invite_token}")
+        self.assertEqual(reused.status_code, 400)
+
     def test_full_round_via_api(self) -> None:
         host = self.client.post("/api/rooms", json={"name": "Host"}).json()
         code = host["room"]["code"]

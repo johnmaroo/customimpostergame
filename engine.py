@@ -176,6 +176,7 @@ class Room:
     pass_and_play: bool = False
     words_visible: bool = False
     irl_mode: IrlMode = "mix"
+    imposter_hints: bool = True
     phase: Phase = "lobby"
     round: RoundState | None = None
     round_number: int = 0
@@ -314,6 +315,7 @@ class GameHub:
         pass_and_play: bool | None = None,
         words_visible: bool | None = None,
         irl_mode: str | None = None,
+        imposter_hints: bool | None = None,
     ) -> None:
         self._require_host(host)
         if room.phase not in ("lobby", "results"):
@@ -335,6 +337,8 @@ class GameHub:
             if cleaned_mode not in IRL_MODES:
                 raise GameError("Pick an IRL turn style from the list.")
             room.irl_mode = cleaned_mode  # type: ignore[assignment]
+        if imposter_hints is not None:
+            room.imposter_hints = bool(imposter_hints)
         self._touch(room)
 
     def add_word(self, room: Room, player: Player, word: str, *, source: str | None = None) -> str:
@@ -473,7 +477,7 @@ class GameHub:
         seated = [pid for pid in room.round.participant_ids if pid in room.players]
         if seated and set(seated).issubset(room.round.ready_ids):
             self._enter_discuss(room)
-        return self._role_payload(room.round, player_id, target.name)
+        return self._role_payload(room, room.round, player_id, target.name)
 
     def next_speaker(self, room: Room, host: Player) -> None:
         self._require_host(host)
@@ -559,9 +563,9 @@ class GameHub:
             "hasVoted": bool(rnd and player.id in rnd.votes),
         }
         if rnd and not sitting_out and room.phase in ("reveal", "discuss", "vote"):
-            you["role"] = self._role_payload(rnd, player.id, player.name)
+            you["role"] = self._role_payload(room, rnd, player.id, player.name)
         elif rnd and room.phase == "results":
-            you["role"] = self._role_payload(rnd, player.id, player.name)
+            you["role"] = self._role_payload(room, rnd, player.id, player.name)
 
         players = []
         for p in room.players.values():
@@ -597,6 +601,7 @@ class GameHub:
             "passAndPlay": room.pass_and_play,
             "wordsVisible": room.words_visible and player.is_host,
             "irlMode": room.irl_mode,
+            "imposterHints": room.imposter_hints,
             "prompt": rnd.prompt if rnd else None,
             "remainingWordCount": len(room.remaining_words),
             "usedWordCount": len(room.used_words),
@@ -742,12 +747,13 @@ class GameHub:
             return set()
         return set(room.round.participant_ids)
 
-    def _role_payload(self, rnd: RoundState, player_id: str, name: str) -> dict[str, Any]:
+    def _role_payload(self, room: Room, rnd: RoundState, player_id: str, name: str) -> dict[str, Any]:
         if player_id in rnd.imposter_ids:
+            show_clue = bool(rnd.clue) and (room.imposter_hints or room.phase == "results")
             return {
                 "kind": "imposter",
                 "name": name,
-                "clue": rnd.clue,
+                "clue": rnd.clue if show_clue else None,
                 "word": None,
             }
         return {

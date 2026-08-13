@@ -251,6 +251,25 @@ class GameHubTests(unittest.TestCase):
         with self.assertRaises(GameError):
             self.hub.set_settings(room, host, irl_mode="dares")
 
+    def test_imposter_hints_can_be_turned_off(self) -> None:
+        room, host, ava, ben = self._table(["Telescope"])
+        self.assertTrue(room.imposter_hints)
+        self.hub.set_settings(room, host, imposter_hints=False)
+        self.assertFalse(room.imposter_hints)
+        rnd = self.hub.start_round(room, host, clue="things for looking far away")
+        imposters = set(rnd.imposter_ids)
+        for player in (host, ava, ben):
+            view = self.hub.view_for(room, player)
+            blob = json.dumps(view)
+            self.assertFalse(view["imposterHints"])
+            if player.id in imposters:
+                self.assertEqual(view["you"]["role"]["kind"], "imposter")
+                self.assertIsNone(view["you"]["role"]["clue"])
+                self.assertNotIn("Telescope", blob)
+                self.assertNotIn("looking far away", blob)
+            else:
+                self.assertEqual(view["you"]["role"]["word"], "Telescope")
+
 
 class DealHelperTests(unittest.TestCase):
     def test_fewest_skips_recent_when_everyone_is_tied(self) -> None:

@@ -173,6 +173,31 @@ class ServerApiTests(unittest.TestCase):
         self.assertEqual(packed.status_code, 200)
         self.assertGreaterEqual(packed.json()["remainingWordCount"], 12)
 
+    def test_host_can_disable_imposter_hints(self) -> None:
+        host = self.client.post("/api/rooms", json={"name": "Host"}).json()
+        self.assertTrue(host["room"]["imposterHints"])
+        code = host["room"]["code"]
+        ava = self.client.post("/api/rooms/join", json={"name": "Ava", "code": code}).json()
+        self.client.post("/api/rooms/join", json={"name": "Ben", "code": code})
+        auth = lambda token: {"Authorization": f"Bearer {token}"}
+        self.client.post("/api/room/words", json={"word": "Toaster"}, headers=auth(host["token"]))
+        updated = self.client.post(
+            "/api/room/settings",
+            json={"imposterHints": False},
+            headers=auth(host["token"]),
+        )
+        self.assertEqual(updated.status_code, 200)
+        self.assertFalse(updated.json()["imposterHints"])
+        started = self.client.post("/api/room/start", headers=auth(host["token"]))
+        self.assertEqual(started.status_code, 200)
+        for token in (host["token"], ava["token"]):
+            view = self.client.get("/api/room", headers=auth(token)).json()
+            self.assertFalse(view["imposterHints"])
+            if view["you"]["role"]["kind"] == "imposter":
+                self.assertIsNone(view["you"]["role"]["clue"])
+            else:
+                self.assertEqual(view["you"]["role"]["word"], "Toaster")
+
 
 if __name__ == "__main__":
     unittest.main()

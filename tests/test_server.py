@@ -103,6 +103,14 @@ class ServerApiTests(unittest.TestCase):
         self.assertEqual(discuss["phase"], "discuss")
 
         self.client.post("/api/room/advance", headers=auth(host["token"]))
+        huddle = self.client.get("/api/room", headers=auth(host["token"])).json()
+        self.assertEqual(huddle["phase"], "huddle")
+
+        self.client.post("/api/room/advance", headers=auth(host["token"]))
+        guess = self.client.get("/api/room", headers=auth(host["token"])).json()
+        self.assertEqual(guess["phase"], "guess")
+
+        self.client.post("/api/room/advance", headers=auth(host["token"]))
         vote_state = self.client.get("/api/room", headers=auth(host["token"])).json()
         self.assertEqual(vote_state["phase"], "vote")
         target = next(p["id"] for p in vote_state["players"] if p["id"] != host["playerId"])

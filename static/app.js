@@ -106,6 +106,8 @@ function roomFingerprint(snap) {
     discussSeconds: snap.discussSeconds,
     passAndPlay: snap.passAndPlay,
     wordsVisible: snap.wordsVisible,
+    irlMode: snap.irlMode,
+    prompt: snap.prompt,
     words: snap.words,
     usedWords: snap.usedWords,
     speakerIndex: snap.speakerIndex,
@@ -263,7 +265,7 @@ function renderHome() {
       <li>You can also type the 4-letter code if you already have the site open.</li>
       <li>The host adds a starter pack or types custom words. Words save for next time.</li>
       <li>Each player taps a private card: faithfuls see the word, imposters see a category.</li>
-      <li>Take turns talking about the word without saying it. Imposters blend in.</li>
+      <li>Take turns on the same IRL question or action — answer it, mime it, or point — without naming the word. Imposters still have to try.</li>
       <li>Vote. If the table names an imposter, the faithfuls score. If not, the imposters do.</li>
     </ol></div>` : ""}
   </section>`;
@@ -304,9 +306,18 @@ function renderHome() {
   };
 }
 
+function irlLabel(mode) {
+  return {
+    mix: "IRL mix",
+    ask: "IRL questions",
+    do: "IRL actions",
+    off: "talk only",
+  }[mode] || "IRL mix";
+}
+
 function settingsPanel(s) {
   if (!s.you.isHost) {
-    return `<div class="panel hint">${s.numImposters} imposter${s.numImposters === 1 ? "" : "s"} · ${s.discussSeconds ? s.discussSeconds + "s discussion" : "host-run discussion"}</div>`;
+    return `<div class="panel hint">${s.numImposters} imposter${s.numImposters === 1 ? "" : "s"} · ${s.discussSeconds ? s.discussSeconds + "s discussion" : "host-run discussion"} · ${esc(irlLabel(s.irlMode))}</div>`;
   }
   return `<div class="panel stack">
     <div class="spread"><h3>Table rules</h3></div>
@@ -327,6 +338,17 @@ function settingsPanel(s) {
         ].map(([v, label]) => `<option value="${v}"${s.discussSeconds === v ? " selected" : ""}>${label}</option>`).join("")}
       </select>
     </label>
+    <label>IRL turns
+      <select id="irl-mode">
+        ${[
+          ["mix", "Mix of questions & actions"],
+          ["ask", "Questions only"],
+          ["do", "Actions only"],
+          ["off", "Off — just talk"],
+        ].map(([v, label]) => `<option value="${v}"${(s.irlMode || "mix") === v ? " selected" : ""}>${label}</option>`).join("")}
+      </select>
+    </label>
+    <p class="hint">Everyone answers the same prompt. Imposters only have the category, so specifics get slippery.</p>
     <label class="toggle">Pass one phone around
       <input id="pass-play" type="checkbox"${s.passAndPlay ? " checked" : ""} />
     </label>
@@ -479,10 +501,11 @@ function bindLobby(s) {
         discussSeconds: Number(app.querySelector("#discuss-seconds").value),
         passAndPlay: app.querySelector("#pass-play").checked,
         wordsVisible: app.querySelector("#words-visible").checked,
+        irlMode: app.querySelector("#irl-mode").value,
       },
     }));
   };
-  ["#num-imposters", "#discuss-seconds", "#pass-play", "#words-visible"].forEach((sel) => {
+  ["#num-imposters", "#discuss-seconds", "#irl-mode", "#pass-play", "#words-visible"].forEach((sel) => {
     const node = app.querySelector(sel);
     if (node) node.onchange = saveSettings;
   });
@@ -566,6 +589,7 @@ function renderReveal() {
           `<button class="vote-btn" data-peek="${p.id}">${esc(p.name)}${p.ready ? " · seen" : ""}</button>`
         ).join("")}
       </div>
+      ${promptCard(s, { hostSwap: true })}
       <button class="btn btn-ghost" id="advance" type="button">Everyone has seen it — discuss</button>
     </section>`;
     app.querySelectorAll("[data-peek]").forEach((btn) => {
@@ -573,6 +597,7 @@ function renderReveal() {
     });
     const hide = app.querySelector("#hide-peek");
     if (hide) hide.onclick = () => { state.peek = null; render(); };
+    bindNextPrompt();
     app.querySelector("#advance").onclick = () => act(() => api("/api/room/advance", { method: "POST" }));
     return;
   }
@@ -586,7 +611,7 @@ function renderReveal() {
       <h2>${state.hidden ? "Look up." : "Private card"}</h2>
       <p class="lede">${state.hidden ? "Keep a straight face." : "Tilt the phone toward you. Nobody else should see this."}</p>
     </div>
-    ${state.hidden ? `<div class="waiting"><span class="dot"></span> Waiting for ${s.players.filter((p) => p.inRound && !p.ready).length} more…</div>` : `
+    ${state.hidden ? `<div class="waiting"><span class="dot"></span> Waiting for ${s.players.filter((p) => p.inRound && !p.ready).length} more…</div>${promptCard(s, { hostSwap: true })}` : `
     <button class="card${showCard ? " flipped" : ""}" id="role-card" type="button">
       <div class="card-inner">
         <div class="face face-front">
@@ -615,6 +640,25 @@ function renderReveal() {
   };
   const advance = app.querySelector("#advance");
   if (advance) advance.onclick = () => act(() => api("/api/room/advance", { method: "POST" }));
+  bindNextPrompt();
+}
+  const prompt = s.prompt;
+  if (!prompt) return "";
+  const kind = prompt.kind === "do" ? "Action" : "Question";
+  const swap = hostSwap && s.you.isHost
+    ? `<button class="btn btn-ghost btn-small" id="next-prompt" type="button">Another prompt</button>`
+    : "";
+  return `<div class="prompt-card ${prompt.kind === "do" ? "do" : "ask"}">
+    <div class="kicker">${kind} · everyone</div>
+    <p>${esc(prompt.text)}</p>
+    <p class="muted">Same prompt for the whole table. Do not name the word.</p>
+    ${swap}
+  </div>`;
+}
+
+function bindNextPrompt() {
+  const btn = app.querySelector("#next-prompt");
+  if (btn) btn.onclick = () => act(() => api("/api/room/next-prompt", { method: "POST" }));
 }
 
 function remainingMs(s) {
@@ -635,14 +679,21 @@ function renderDiscuss() {
   const speaker = s.speakingOrder[s.speakerIndex] || s.speakingOrder[0];
   const total = (s.discussSeconds || 0) * 1000;
   const pct = ms == null || !total ? 100 : Math.max(0, Math.round((ms / total) * 100));
+  const headline = s.prompt
+    ? (s.prompt.kind === "do" ? "Do this" : "Answer this")
+    : "Talk around the word";
+  const lede = s.prompt
+    ? "Then keep talking around the word. Imposters should still sound like they belong."
+    : "Do not say it. Imposters should still sound like they belong.";
   app.innerHTML = `<section class="screen stack-lg">
     ${toast()}
     <div>
       <div class="kicker">Discussion</div>
-      <h2>Talk around the word</h2>
-      <p class="lede">Do not say it. Imposters should still sound like they belong.</p>
+      <h2>${headline}</h2>
+      <p class="lede">${lede}</p>
     </div>
     ${ms != null ? `<div class="timer${ms < 15000 ? " warn" : ""}">${formatMs(ms)}</div><div class="bar"><span style="--p:${pct}%"></span></div>` : `<p class="hint">No timer — host decides when to vote.</p>`}
+    ${promptCard(s, { hostSwap: true })}
     <div class="speaker">
       <div class="kicker">Speaking now</div>
       <strong>${esc(speaker?.name || "—")}</strong>
@@ -653,6 +704,7 @@ function renderDiscuss() {
       <button class="btn" id="advance" type="button">Start vote</button>
     </div>` : `<p class="hint">Listen for your name in the speaking order.</p>`}
   </section>`;
+  bindNextPrompt();
   const next = app.querySelector("#next-speaker");
   if (next) next.onclick = () => act(() => api("/api/room/next-speaker", { method: "POST" }));
   const advance = app.querySelector("#advance");
@@ -704,6 +756,7 @@ function renderResults() {
       <div class="kicker">${townWon ? "Faithfuls" : "Imposters"}</div>
       <h2>${townWon ? "Caught them." : "They got away."}</h2>
       <p>The word was <strong>${esc(result.word)}</strong></p>
+      ${s.prompt ? `<p class="muted">${s.prompt.kind === "do" ? "Action" : "Question"}: ${esc(s.prompt.text)}</p>` : ""}
     </div>
     <div class="panel stack">
       <h3>Imposter${imposters.length === 1 ? "" : "s"}</h3>

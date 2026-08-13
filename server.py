@@ -72,6 +72,7 @@ class SettingsBody(BaseModel):
     discussSeconds: int | None = None
     passAndPlay: bool | None = None
     wordsVisible: bool | None = None
+    irlMode: str | None = None
 
 
 class VoteBody(BaseModel):
@@ -261,6 +262,7 @@ def settings(
             discuss_seconds=body.discussSeconds,
             pass_and_play=body.passAndPlay,
             words_visible=body.wordsVisible,
+            irl_mode=body.irlMode,
         )
         return _snapshot(room, player, request)
 
@@ -301,7 +303,7 @@ def add_pack(
     with lock:
         room, player = hub.resolve_token(_token(authorization))
         for word, fallback in pack["words"]:
-            added = hub.add_word(room, player, word)
+            added = hub.add_word(room, player, word, source=pack["id"])
             _persist_word(added, fallback_clue=fallback)
         return _snapshot(room, player, request)
 
@@ -392,6 +394,16 @@ def next_speaker(
     with lock:
         room, player = hub.resolve_token(_token(authorization))
         hub.next_speaker(room, player)
+        return _snapshot(room, player, request)
+
+
+@app.post("/api/room/next-prompt")
+def next_prompt(
+    request: Request, authorization: str | None = Header(default=None)
+) -> dict[str, Any]:
+    with lock:
+        room, player = hub.resolve_token(_token(authorization))
+        hub.next_prompt(room, player)
         return _snapshot(room, player, request)
 
 

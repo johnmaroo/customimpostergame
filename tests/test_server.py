@@ -101,6 +101,12 @@ class ServerApiTests(unittest.TestCase):
             self.client.post("/api/room/ready", headers=auth(token))
         discuss = self.client.get("/api/room", headers=auth(host["token"])).json()
         self.assertEqual(discuss["phase"], "discuss")
+        self.assertIsNotNone(discuss["prompt"])
+        self.assertEqual(discuss["prompt"], self.client.get("/api/room", headers=auth(ava["token"])).json()["prompt"])
+
+        swapped = self.client.post("/api/room/next-prompt", headers=auth(host["token"]))
+        self.assertEqual(swapped.status_code, 200)
+        self.assertNotEqual(swapped.json()["prompt"]["id"], discuss["prompt"]["id"])
 
         self.client.post("/api/room/advance", headers=auth(host["token"]))
         vote_state = self.client.get("/api/room", headers=auth(host["token"])).json()

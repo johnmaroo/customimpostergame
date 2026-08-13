@@ -184,6 +184,68 @@ class GameHubTests(unittest.TestCase):
         with self.assertRaises(GameError):
             self.hub.add_invite(room, host, "Ben", "+15550001111")
 
+    def test_round_deals_shared_irl_prompt(self) -> None:
+        room, host, ava, ben = self._table(["Toaster"])
+        rnd = self.hub.start_round(room, host)
+        self.assertIsNotNone(rnd.prompt)
+        self.assertIn(rnd.prompt["kind"], {"ask", "do"})
+        views = [self.hub.view_for(room, p) for p in (host, ava, ben)]
+        texts = {view["prompt"]["text"] for view in views}
+        self.assertEqual(len(texts), 1)
+        self.assertEqual(views[0]["irlMode"], "mix")
+        for view in views:
+            blob = json.dumps(view)
+            if view["you"]["role"]["kind"] == "imposter":
+                self.assertNotIn("Toaster", blob)
+
+    def test_irl_off_skips_prompt(self) -> None:
+        room, host, _ava, _ben = self._table(["Toaster"])
+        self.hub.set_settings(room, host, irl_mode="off")
+        rnd = self.hub.start_round(room, host)
+        self.assertIsNone(rnd.prompt)
+        self.assertIsNone(self.hub.view_for(room, host)["prompt"])
+
+    def test_ask_mode_deals_a_question(self) -> None:
+        room, host, _ava, _ben = self._table(["Toaster"])
+        self.hub.set_settings(room, host, irl_mode="ask")
+        rnd = self.hub.start_round(room, host)
+        self.assertEqual(rnd.prompt["kind"], "ask")
+
+    def test_host_can_swap_prompt_during_discuss(self) -> None:
+        room, host, ava, ben = self._table(["Toaster"])
+        self.hub.start_round(room, host)
+        first = room.round.prompt["id"]
+        for player in (host, ava, ben):
+            self.hub.mark_ready(room, player)
+        swapped = self.hub.next_prompt(room, host)
+        self.assertIsNotNone(swapped)
+        self.assertNotEqual(swapped["id"], first)
+        self.assertEqual(room.round.prompt["id"], swapped["id"])
+
+    def test_pack_word_can_draw_pack_prompt(self) -> None:
+        from prompts import eligible_prompts
+
+        room, host, _ava, _ben = self._table()
+        self.hub.add_word(room, host, "Penguin", source="animals")
+        self.hub.set_settings(room, host, irl_mode="do")
+        pack_ids = {prompt["id"] for prompt in eligible_prompts("do", "animals") if prompt["packs"]}
+        seen: set[str] = set()
+        for _ in range(40):
+            room.remaining_words = ["Penguin"]
+            room.used_words = []
+            room.phase = "lobby"
+            room.round = None
+            rnd = self.hub.start_round(room, host)
+            seen.add(rnd.prompt["id"])
+            if seen & pack_ids:
+                break
+        self.assertTrue(seen & pack_ids)
+
+    def test_invalid_irl_mode_rejected(self) -> None:
+        room, host, _ava, _ben = self._table()
+        with self.assertRaises(GameError):
+            self.hub.set_settings(room, host, irl_mode="dares")
+
 
 if __name__ == "__main__":
     unittest.main()

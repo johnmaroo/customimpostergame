@@ -5,6 +5,8 @@ venv/
 .env
 wordbank.db
 *.db
+*.db-wal
+*.db-shm
 .pytest_cache/
 .DS_Store
 .vercel/

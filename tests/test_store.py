@@ -1,9 +1,11 @@
 import json
+import socket
 import time
 import unittest
 from dataclasses import fields
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Any
 from unittest.mock import patch
 
 import httpx
@@ -210,15 +212,16 @@ class RedisRestStoreTests(unittest.TestCase):
         with self.assertRaises(StoreConflict):
             store.save(stale)
 
-    def test_it_still_works_without_scripting(self) -> None:
+    def test_a_cache_without_scripting_still_hosts_the_game(self) -> None:
         fake = FakeRedis(eval_supported=False)
-        store = redis_store(fake)
-        hub = GameHub(store=store)
-        room, players = played_room(hub)
+        hub = GameHub(store=redis_store(fake))
+        room, _players = played_room(hub)
         reread = redis_store(fake).load(room.code)
         self.assertEqual(sorted(reread.players), sorted(room.players))
-        self.assertEqual({parts[0] for parts in fake.commands} & {"EVAL"}, {"EVAL"})
-        self.assertIn("SET", {parts[0] for parts in fake.commands})
+        self.assertEqual(reread.phase, room.phase)
+        tried = [parts[0] for parts in fake.commands]
+        self.assertIn("EVAL", tried)
+        self.assertIn("SET", tried)
 
     def test_an_unreachable_store_says_so(self) -> None:
         def refuse(request: httpx.Request) -> httpx.Response:
@@ -243,6 +246,113 @@ class RedisRestStoreTests(unittest.TestCase):
         )
         with self.assertRaises(StoreUnavailable):
             store.load("KNTQ")
+
+
+def redis_is_running(host: str = "127.0.0.1", port: int = 6379) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=0.3) as sock:
+            sock.sendall(b"*1\r\n$4\r\nPING\r\n")
+            return sock.recv(64).startswith(b"+PONG")
+    except OSError:
+        return False
+
+
+class ResplessRedis:
+    """Speaks the REST shape of Upstash on top of a plain Redis connection.
+
+    The mock above proves the client's bookkeeping; this proves the commands
+    and the compare-and-set script are the ones Redis actually understands.
+    """
+
+    def __init__(self, host: str = "127.0.0.1", port: int = 6379) -> None:
+        self.sock = socket.create_connection((host, port), timeout=2)
+        self.buffer = b""
+
+    def close(self) -> None:
+        self.sock.close()
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        parts = [str(part) for part in json.loads(request.content)]
+        wire = f"*{len(parts)}\r\n".encode()
+        for part in parts:
+            raw = part.encode()
+            wire += b"$%d\r\n%s\r\n" % (len(raw), raw)
+        self.sock.sendall(wire)
+        try:
+            return httpx.Response(200, json={"result": self._reply()})
+        except RuntimeError as exc:
+            return httpx.Response(200, json={"error": str(exc)})
+
+    def _line(self) -> bytes:
+        while b"\r\n" not in self.buffer:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise RuntimeError("ERR connection closed")
+            self.buffer += chunk
+        line, _, rest = self.buffer.partition(b"\r\n")
+        self.buffer = rest
+        return line
+
+    def _reply(self) -> Any:
+        line = self._line()
+        kind, body = line[:1], line[1:]
+        if kind in (b"+", b":"):
+            return int(body) if kind == b":" else body.decode()
+        if kind == b"-":
+            raise RuntimeError(body.decode())
+        if kind == b"$":
+            size = int(body)
+            if size < 0:
+                return None
+            while len(self.buffer) < size + 2:
+                self.buffer += self.sock.recv(4096)
+            value, self.buffer = self.buffer[:size], self.buffer[size + 2 :]
+            return value.decode()
+        if kind == b"*":
+            return [self._reply() for _ in range(max(0, int(body)))]
+        raise RuntimeError(f"ERR unexpected reply {line!r}")
+
+
+@unittest.skipUnless(redis_is_running(), "no Redis on 127.0.0.1:6379")
+class RealRedisTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.wire = ResplessRedis()
+        self.addCleanup(self.wire.close)
+
+    def store(self, **kwargs) -> RedisRestStore:
+        client = httpx.Client(transport=httpx.MockTransport(self.wire.handler))
+        return RedisRestStore("https://redis.example", "token", client=client, **kwargs)
+
+    def test_two_instances_share_one_table(self) -> None:
+        store = self.store()
+        hub = GameHub(store=store)
+        room, players = played_room(hub)
+        self.addCleanup(store.delete, room.code)
+
+        other = GameHub(store=self.store())
+        seen_room, seen_player = other.resolve_token(players[1].token)
+        self.assertEqual(seen_room.code, room.code)
+        self.assertEqual(seen_player.name, "Ava")
+        self.assertEqual(seen_room.round.word, room.round.word)
+
+    def test_the_script_refuses_a_stale_write(self) -> None:
+        store = self.store()
+        hub = GameHub(store=store)
+        room, players = played_room(hub)
+        self.addCleanup(store.delete, room.code)
+        stale = self.store().load(room.code)
+
+        hub.advance(room, players[0])
+        with self.assertRaises(StoreConflict):
+            store.save(stale)
+        self.assertEqual(self.store().load(room.code).phase, "discuss")
+
+    def test_a_deleted_table_reads_as_gone(self) -> None:
+        store = self.store()
+        hub = GameHub(store=store)
+        room, _ = hub.create_room("Host")
+        store.delete(room.code)
+        self.assertIsNone(store.load(room.code))
 
 
 class StoreChoiceTests(unittest.TestCase):

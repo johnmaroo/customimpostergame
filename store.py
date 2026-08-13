@@ -203,13 +203,19 @@ class RedisRestStore:
         return room
 
     def save(self, room: Room) -> None:
+        """Write the room, refusing the write if another instance got there first.
+
+        A cache that cannot run the script (an older or cut-down Redis) keeps
+        the game going with a plain write instead: a lost race beats a table
+        nobody can reach.
+        """
         expected = room.version
         payload = f"{expected + 1}\n{json.dumps(room_to_dict(room))}"
         ttl = str(int(self.ttl_seconds))
         if self._compare_and_set:
             written = self._command(
                 ["EVAL", _CAS_SCRIPT, "1", self._key(room.code), str(expected), payload, ttl],
-                on_unsupported=self._drop_compare_and_set,
+                on_script_error=self._drop_compare_and_set,
             )
             if written is not None:
                 if not int(written or 0):
@@ -234,7 +240,7 @@ class RedisRestStore:
     def _key(self, code: str) -> str:
         return f"{ROOM_KEY_PREFIX}{code}"
 
-    def _command(self, parts: list[Any], on_unsupported: Any = None) -> Any:
+    def _command(self, parts: list[Any], on_script_error: Any = None) -> Any:
         try:
             response = self.client.post(self.url, headers=self._headers, json=parts)
             body = response.json()
@@ -242,18 +248,15 @@ class RedisRestStore:
             raise StoreUnavailable(str(exc)) from exc
         error = body.get("error") if isinstance(body, dict) else None
         if error:
-            if on_unsupported is not None and _is_unsupported(error):
-                on_unsupported()
+            # The cache answered but disliked the command, which is a problem
+            # with the command rather than with reaching the cache.
+            if on_script_error is not None and response.status_code < 400:
+                on_script_error()
                 return None
             raise StoreUnavailable(str(error))
         if response.status_code >= 400:
             raise StoreUnavailable(f"room store returned {response.status_code}")
         return body.get("result") if isinstance(body, dict) else None
-
-
-def _is_unsupported(error: str) -> bool:
-    lowered = str(error).lower()
-    return "unknown command" in lowered or "not supported" in lowered or "unsupported" in lowered
 
 
 def create_store(ttl_seconds: float | None = None) -> RoomStore:

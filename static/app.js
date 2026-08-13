@@ -10,12 +10,23 @@ const state = {
   hidden: false,
   peek: null,
   name: localStorage.getItem("imposter.name") || "",
+  tableCode: localStorage.getItem("imposter.code") || "",
   joinCode: "",
   inviteToken: "",
   busy: false,
+  offline: false,
   lastInvite: null,
   drafts: { word: "", inviteName: "", invitePhone: "", focus: "", selStart: null, selEnd: null },
 };
+
+// A locked phone, a sleeping laptop, or a server catching its breath should
+// never cost you your seat. Only these say the seat itself is gone.
+const SEAT_LOST = new Set(["session_invalid", "not_seated", "no_session", "room_closed"]);
+const POLL_ACTIVE_MS = 2000;
+const POLL_RESTING_MS = 4000;
+const POLL_MAX_MS = 15000;
+// Phones drop a request now and then; wait for a couple before crying wolf.
+const QUIET_RETRIES = 2;
 
 const PALETTE = ["#e8c37a", "#ff8fa0", "#8ed6f7", "#9be7b7", "#c4b5fd", "#fb923c", "#f9a8d4", "#67e8f9"];
 
@@ -143,9 +154,7 @@ function goHome() {
     } catch {
       /* already gone */
     }
-    setToken("");
-    state.snapshot = null;
-    state.lastInvite = null;
+    forgetSession();
     return {};
   });
 }
@@ -164,24 +173,60 @@ function hostEndButton(s) {
   return `<button class="btn btn-ghost" id="end-game" type="button">End game</button>`;
 }
 
+class ApiError extends Error {
+  constructor(message, { status = 0, code = "" } = {}) {
+    super(message);
+    this.status = status;
+    this.code = code;
+  }
+}
+
 async function api(path, { method = "GET", body } = {}) {
   const headers = { Accept: "application/json" };
   if (body !== undefined) headers["Content-Type"] = "application/json";
   if (state.token) headers.Authorization = `Bearer ${state.token}`;
-  const res = await fetch(path, {
-    method,
-    headers,
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-  });
+  let res;
+  try {
+    res = await fetch(path, {
+      method,
+      headers,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+  } catch {
+    throw new ApiError("Cannot reach the table right now.", { code: "offline" });
+  }
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || "Something went wrong.");
+  if (!res.ok) {
+    throw new ApiError(data.error || "Something went wrong.", {
+      status: res.status,
+      code: data.code || "",
+    });
+  }
   return data;
+}
+
+function seatIsLost(err) {
+  return SEAT_LOST.has(err?.code);
 }
 
 function setToken(token) {
   state.token = token || "";
   if (token) localStorage.setItem("imposter.token", token);
   else localStorage.removeItem("imposter.token");
+}
+
+function rememberTable(snap) {
+  state.tableCode = snap?.code || "";
+  if (state.tableCode) localStorage.setItem("imposter.code", state.tableCode);
+  else localStorage.removeItem("imposter.code");
+}
+
+function forgetSession() {
+  setToken("");
+  state.snapshot = null;
+  state.peek = null;
+  state.lastInvite = null;
+  rememberTable(null);
 }
 
 function setError(err) {
@@ -262,6 +307,17 @@ function restoreDrafts() {
 }
 
 let refreshInFlight = false;
+let missedPolls = 0;
+
+function noteReachable() {
+  missedPolls = 0;
+  state.offline = false;
+}
+
+function noteUnreachable() {
+  missedPolls += 1;
+  state.offline = missedPolls > QUIET_RETRIES;
+}
 
 async function refresh() {
   if (!state.token || refreshInFlight) return;
@@ -271,23 +327,28 @@ async function refresh() {
     const phaseChanged = Boolean(state.snapshot && state.snapshot.phase !== snap.phase);
     const roundChanged = Boolean(state.snapshot && state.snapshot.roundNumber !== snap.roundNumber);
     const changed = roomFingerprint(state.snapshot) !== roomFingerprint(snap);
-    const hadError = Boolean(state.error);
+    const wasNoisy = Boolean(state.error) || state.offline || !state.snapshot;
     state.snapshot = snap;
+    rememberTable(snap);
     if (phaseChanged || roundChanged) {
       state.flipped = false;
       state.hidden = false;
       state.peek = null;
     }
+    noteReachable();
     setError("");
-    if (changed || phaseChanged || hadError) render();
+    if (changed || phaseChanged || wasNoisy) render();
   } catch (err) {
-    const message = String(err.message || "").toLowerCase();
-    if (message.includes("session expired") || message.includes("sign in to this room")) {
-      setToken("");
-      state.snapshot = null;
+    if (seatIsLost(err)) {
+      forgetSession();
+      setError(err);
+      render();
+    } else {
+      // Keep the seat and the last view on screen; this is worth retrying.
+      const wasOffline = state.offline;
+      noteUnreachable();
+      if (state.offline !== wasOffline || missedPolls === 1) render();
     }
-    setError(err);
-    render();
   } finally {
     refreshInFlight = false;
   }
@@ -305,16 +366,23 @@ async function act(fn) {
       state.peek = result.role;
       state.snapshot = result.room;
     }
+    rememberTable(state.snapshot);
+    noteReachable();
     setError("");
   } catch (err) {
+    if (seatIsLost(err)) forgetSession();
     setError(err);
   } finally {
     state.busy = false;
     render();
+    schedulePoll();
   }
 }
 
 function toast() {
+  if (state.offline) {
+    return `<div class="toast notice" role="status">Reconnecting to the table…</div>`;
+  }
   return state.error ? `<div class="toast" role="alert">${esc(state.error)}</div>` : "";
 }
 
@@ -948,11 +1016,26 @@ function renderEnded() {
   if (leave) leave.onclick = () => goHome();
 }
 
+function renderReconnecting() {
+  const code = state.tableCode;
+  app.innerHTML = `<section class="screen stack-lg">
+    ${toast()}
+    <div class="hero">
+      <div class="kicker">Holding your seat</div>
+      ${code ? `<div class="room-code">${esc(code)}</div>` : `<h1 class="title">IMPOSTER</h1>`}
+      <p class="lede">Picking up where you left off. A locked screen or a dropped signal does not cost you your place at the table.</p>
+    </div>
+    <button class="btn btn-ghost" id="leave" type="button">Start over</button>
+  </section>`;
+  app.querySelector("#leave").onclick = () => goHome();
+}
+
 function render() {
   if (state.snapshot && state.snapshot.phase === "lobby") captureDrafts();
   const s = state.snapshot;
   if (!s) {
-    renderHome();
+    if (state.token) renderReconnecting();
+    else renderHome();
     return;
   }
   const phase = s.phase;
@@ -969,6 +1052,7 @@ function render() {
 
 let pollId = 0;
 let timerId = 0;
+let bootId = 0;
 
 function tickTimers() {
   clearInterval(timerId);
@@ -993,42 +1077,75 @@ function tickTimers() {
   }, 250);
 }
 
-function startPolling() {
-  clearInterval(pollId);
-  pollId = setInterval(() => {
-    if (state.token && !state.busy && !refreshInFlight) refresh();
-  }, 2000);
+function pollDelay() {
+  if (missedPolls) {
+    // Back off while the table is unreachable, then snap back once it answers.
+    return Math.min(POLL_MAX_MS, POLL_ACTIVE_MS * 2 ** (missedPolls - 1));
+  }
+  const phase = state.snapshot?.phase;
+  return phase === "reveal" || phase === "discuss" || phase === "vote"
+    ? POLL_ACTIVE_MS
+    : POLL_RESTING_MS;
+}
+
+function schedulePoll() {
+  clearTimeout(pollId);
+  pollId = setTimeout(async () => {
+    // A hidden tab stops asking; coming back triggers an immediate refresh.
+    if (state.token && !state.busy && document.visibilityState !== "hidden") await refresh();
+    schedulePoll();
+  }, pollDelay());
+}
+
+async function claimInvite() {
+  const info = await api(`/api/invites/${encodeURIComponent(state.inviteToken)}`);
+  state.name = info.name;
+  state.joinCode = info.code;
+  localStorage.setItem("imposter.name", info.name);
+  const result = await api("/api/rooms/join", {
+    method: "POST",
+    body: { name: info.name, code: info.code, inviteToken: state.inviteToken },
+  });
+  setToken(result.token);
+  state.snapshot = result.room;
+  rememberTable(result.room);
+  history.replaceState({}, "", `/join/${info.code}`);
 }
 
 async function boot() {
+  clearTimeout(bootId);
   state.joinCode = joinCodeFromLocation();
   state.inviteToken = inviteTokenFromLocation();
   await loadMeta();
   if (state.inviteToken && !state.token) {
     try {
-      const info = await api(`/api/invites/${encodeURIComponent(state.inviteToken)}`);
-      state.name = info.name;
-      state.joinCode = info.code;
-      localStorage.setItem("imposter.name", info.name);
-      const result = await api("/api/rooms/join", {
-        method: "POST",
-        body: { name: info.name, code: info.code, inviteToken: state.inviteToken },
-      });
-      setToken(result.token);
-      state.snapshot = result.room;
-      history.replaceState({}, "", `/join/${info.code}`);
+      await claimInvite();
+      noteReachable();
     } catch (err) {
+      if (err.code === "offline" || err.status >= 500) {
+        // The invite is still good; the network was not. Try again shortly.
+        noteUnreachable();
+        bootId = setTimeout(boot, pollDelay());
+      }
       setError(err);
     }
   }
   if (state.token) await refresh();
   else render();
-  startPolling();
+  schedulePoll();
   tickTimers();
 }
 
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible") refresh();
+  if (document.visibilityState !== "visible") return;
+  refresh();
+  schedulePoll();
+});
+
+window.addEventListener("online", () => {
+  missedPolls = 0;
+  refresh();
+  schedulePoll();
 });
 
 boot();

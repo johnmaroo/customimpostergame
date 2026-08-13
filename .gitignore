@@ -4,6 +4,7 @@ __pycache__/
 venv/
 .env
 wordbank.db
+imposter-rooms.json
 *.db
 *.db-wal
 *.db-shm

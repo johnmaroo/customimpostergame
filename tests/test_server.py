@@ -148,6 +148,14 @@ class ServerApiTests(unittest.TestCase):
         self.assertNotEqual(swapped.json()["prompt"]["id"], discuss["prompt"]["id"])
 
         self.client.post("/api/room/advance", headers=auth(host["token"]))
+        huddle = self.client.get("/api/room", headers=auth(host["token"])).json()
+        self.assertEqual(huddle["phase"], "huddle")
+
+        self.client.post("/api/room/advance", headers=auth(host["token"]))
+        guess = self.client.get("/api/room", headers=auth(host["token"])).json()
+        self.assertEqual(guess["phase"], "guess")
+
+        self.client.post("/api/room/advance", headers=auth(host["token"]))
         vote_state = self.client.get("/api/room", headers=auth(host["token"])).json()
         self.assertEqual(vote_state["phase"], "vote")
         target = next(p["id"] for p in vote_state["players"] if p["id"] != host["playerId"])
@@ -226,6 +234,26 @@ class ServerApiTests(unittest.TestCase):
             else:
                 self.assertEqual(view["you"]["role"]["word"], "Toaster")
 
+    def test_same_name_rejoins_after_session_drop(self) -> None:
+        host = self.client.post("/api/rooms", json={"name": "Host"}).json()
+        code = host["room"]["code"]
+        ava = self.client.post("/api/rooms/join", json={"name": "Ava", "code": code}).json()
+        old_token = ava["token"]
+        player_id = ava["playerId"]
+        again = self.client.post("/api/rooms/join", json={"name": "Ava", "code": code})
+        self.assertEqual(again.status_code, 200)
+        self.assertEqual(again.json()["playerId"], player_id)
+        self.assertNotEqual(again.json()["token"], old_token)
+        stale = self.client.get("/api/room", headers={"Authorization": f"Bearer {old_token}"})
+        self.assertEqual(stale.status_code, 401)
+        fresh = self.client.get(
+            "/api/room",
+            headers={"Authorization": f"Bearer {again.json()['token']}"},
+        )
+        self.assertEqual(fresh.status_code, 200)
+        self.assertEqual(fresh.json()["you"]["name"], "Ava")
+        self.assertEqual(fresh.json()["code"], code)
+
 
 class ReconnectTests(unittest.TestCase):
     """The reported bug: a phone that waits too long is told its session died."""
@@ -302,6 +330,66 @@ class ReconnectTests(unittest.TestCase):
         self.assertEqual(guest["phase"], "reveal")
         self.assertEqual(guest["roundNumber"], started["roundNumber"])
         self.assertIn(guest["you"]["role"]["kind"], {"imposter", "faithful"})
+
+    def test_a_missed_guess_is_still_missed_after_a_restart(self) -> None:
+        host = self.client.post("/api/rooms", json={"name": "Host"}).json()
+        code = host["room"]["code"]
+        ava = self.client.post("/api/rooms/join", json={"name": "Ava", "code": code}).json()
+        ben = self.client.post("/api/rooms/join", json={"name": "Ben", "code": code}).json()
+        auth = lambda token: {"Authorization": f"Bearer {token}"}
+        self.client.post(
+            "/api/room/settings", json={"numImposters": 2}, headers=auth(host["token"])
+        )
+        self.client.post(
+            "/api/room/words/pack", json={"packId": "party"}, headers=auth(host["token"])
+        )
+        self.client.post("/api/room/start", headers=auth(host["token"]))
+        for _ in range(3):
+            self.client.post("/api/room/advance", headers=auth(host["token"]))
+        seats = {host["playerId"]: host, ava["playerId"]: ava, ben["playerId"]: ben}
+        guessing = self.client.get("/api/room", headers=auth(host["token"])).json()
+        self.assertEqual(guessing["phase"], "guess")
+        imposter = next(
+            seats[p["id"]]
+            for p in guessing["players"]
+            if self.client.get("/api/room", headers=auth(seats[p["id"]]["token"])).json()["you"][
+                "canGuess"
+            ]
+        )
+        missed = self.client.post(
+            "/api/room/guess", json={"word": "not it"}, headers=auth(imposter["token"])
+        )
+        self.assertEqual(missed.status_code, 200)
+
+        self.restart()
+
+        back = self.client.get("/api/room", headers=auth(imposter["token"])).json()
+        self.assertEqual(back["phase"], "guess")
+        self.assertTrue(back["you"]["hasGuessed"])
+        self.assertFalse(back["you"]["canGuess"])
+        spent = self.client.post(
+            "/api/room/guess", json={"word": "second try"}, headers=auth(imposter["token"])
+        )
+        self.assertEqual(spent.status_code, 400)
+
+    def test_a_lost_phone_sits_back_down_under_the_same_name(self) -> None:
+        host = self.client.post("/api/rooms", json={"name": "Host"}).json()
+        code = host["room"]["code"]
+        ava = self.client.post("/api/rooms/join", json={"name": "Ava", "code": code}).json()
+
+        self.restart()
+
+        again = self.client.post("/api/rooms/join", json={"name": "Ava", "code": code}).json()
+        self.assertEqual(again["playerId"], ava["playerId"])
+        self.assertNotEqual(again["token"], ava["token"])
+        stale = self.client.get("/api/room", headers={"Authorization": f"Bearer {ava['token']}"})
+        self.assertEqual(stale.status_code, 401)
+        self.assertEqual(stale.json()["code"], "not_seated")
+        fresh = self.client.get(
+            "/api/room", headers={"Authorization": f"Bearer {again['token']}"}
+        )
+        self.assertEqual(fresh.status_code, 200)
+        self.assertEqual(fresh.json()["you"]["name"], "Ava")
 
     def test_an_unreachable_store_is_worth_retrying(self) -> None:
         host = self.client.post("/api/rooms", json={"name": "Host"}).json()

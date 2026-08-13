@@ -105,6 +105,10 @@ class SettingsBody(BaseModel):
     imposterHints: bool | None = None
 
 
+class GuessBody(BaseModel):
+    word: str | None = None
+
+
 class VoteBody(BaseModel):
     targetId: str | None = None
 
@@ -510,11 +514,31 @@ def next_speaker(
     return _play(authorization, request, lambda room, player: hub.next_speaker(room, player))
 
 
+@app.post("/api/room/around-again")
+def around_again(
+    request: Request, authorization: str | None = Header(default=None)
+) -> dict[str, Any]:
+    return _play(authorization, request, lambda room, player: hub.go_around_again(room, player))
+
+
 @app.post("/api/room/next-prompt")
 def next_prompt(
     request: Request, authorization: str | None = Header(default=None)
 ) -> dict[str, Any]:
     return _play(authorization, request, lambda room, player: hub.next_prompt(room, player))
+
+
+@app.post("/api/room/guess")
+def guess_word(
+    body: GuessBody,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return _play(
+        authorization,
+        request,
+        lambda room, player: hub.guess_word(room, player, body.word),
+    )
 
 
 @app.post("/api/room/advance")

@@ -16,11 +16,13 @@ from engine import (
     GameHub,
     MemoryStore,
     Room,
+    RoundState,
     StoreConflict,
     StoreUnavailable,
     room_from_dict,
     room_to_dict,
     serialized_room_fields,
+    serialized_round_fields,
 )
 from store import RedisRestStore, SqliteStore, create_store, room_ttl_seconds
 
@@ -38,10 +40,37 @@ def played_room(hub: GameHub) -> tuple[Room, list]:
     return room, [host, ava, ben]
 
 
+def guessing_room(hub: GameHub) -> tuple[Room, list]:
+    """A table carried through the circle to the imposters' one guess.
+
+    Two imposters, one of whom has already missed, so the round is caught
+    mid-guess rather than resolved.
+    """
+    room, host = hub.create_room("Host")
+    _, ava = hub.join_room(room.code, "Ava")
+    _, ben = hub.join_room(room.code, "Ben")
+    hub.set_settings(room, host, num_imposters=2)
+    for word in ("Toaster", "Volcano", "Sandcastle"):
+        hub.add_word(room, host, word)
+    hub.start_round(room, host)
+    players = [host, ava, ben]
+    hub.advance(room, host)  # reveal -> the speaking circle
+    hub.go_around_again(room, host)
+    hub.advance(room, host)  # -> open floor
+    hub.advance(room, host)  # -> guessing
+    misser = next(p for p in players if p.id in room.round.imposter_ids)
+    hub.guess_word(room, misser, "definitely not the word")
+    return room, players
+
+
 class RoomSerializationTests(unittest.TestCase):
     def test_every_room_field_is_written(self) -> None:
         declared = {f.name for f in fields(Room)}
         self.assertEqual(declared, serialized_room_fields())
+
+    def test_every_round_field_is_written(self) -> None:
+        declared = {f.name for f in fields(RoundState)}
+        self.assertEqual(declared, serialized_round_fields())
 
     def test_round_trip_keeps_the_table_intact(self) -> None:
         hub = GameHub()
@@ -64,6 +93,19 @@ class RoomSerializationTests(unittest.TestCase):
         for player in players:
             self.assertEqual(restored.players[player.id].name, player.name)
             self.assertEqual(restored.players[player.id].score, player.score)
+
+    def test_a_half_finished_guess_round_round_trips(self) -> None:
+        hub = GameHub()
+        room, _players = guessing_room(hub)
+        restored = room_from_dict(json.loads(json.dumps(room_to_dict(room))))
+
+        self.assertEqual(restored.phase, "guess")
+        self.assertEqual(restored.round.lap, room.round.lap)
+        self.assertEqual(restored.round.guesses, room.round.guesses)
+        self.assertEqual(restored.round.clue_unlocked, room.round.clue_unlocked)
+        self.assertEqual(restored.round.win_reason, room.round.win_reason)
+        self.assertEqual(restored.round.guessed_by, room.round.guessed_by)
+        self.assertEqual(restored.round.speaking_order, room.round.speaking_order)
 
     def test_bearer_tokens_are_never_written_down(self) -> None:
         hub = GameHub()

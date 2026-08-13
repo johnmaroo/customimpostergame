@@ -389,6 +389,12 @@ input:focus, select:focus {
   text-align: center;
 }
 
+.speaker.you {
+  border-style: solid;
+  border-color: var(--gold);
+  background: rgba(232, 195, 122, 0.08);
+}
+
 .prompt-card {
   padding: 18px 16px;
   border-radius: 20px;
@@ -415,7 +421,6 @@ input:focus, select:focus {
 }
 
 .prompt-card .btn-small { margin-top: 4px; }
-
 .speaker strong {
   display: block;
   font-size: 1.4rem;

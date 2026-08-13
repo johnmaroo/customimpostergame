@@ -459,6 +459,35 @@ input:focus, select:focus {
   cursor: pointer;
   font: inherit;
   padding: 0;
+  text-decoration: none;
+}
+
+a.linkish { display: inline; }
+
+.qr-wrap {
+  background: #f6f0e6;
+  color: #100c0a;
+  border-radius: 28px;
+  padding: 18px 16px 14px;
+  display: grid;
+  justify-items: center;
+  gap: 8px;
+  text-align: center;
+}
+
+.qr-wrap .kicker { color: #8a6a32; }
+.qr-wrap .room-code { color: #100c0a; padding: 0; letter-spacing: 0.22em; font-size: 2.1rem; }
+.qr-wrap .hint { color: #6d5c48; }
+
+.qr-frame {
+  width: min(100%, 236px);
+  background: #f6f0e6;
+}
+
+.qr-frame svg {
+  width: 100%;
+  height: auto;
+  display: block;
 }
 
 .waiting {

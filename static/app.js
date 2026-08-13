@@ -11,7 +11,10 @@ const state = {
   peek: null,
   name: localStorage.getItem("imposter.name") || "",
   joinCode: "",
+  inviteToken: "",
   busy: false,
+  lastInvite: null,
+  drafts: { word: "", inviteName: "", invitePhone: "", focus: "", selStart: null, selEnd: null },
 };
 
 const PALETTE = ["#e8c37a", "#ff8fa0", "#8ed6f7", "#9be7b7", "#c4b5fd", "#fb923c", "#f9a8d4", "#67e8f9"];
@@ -42,6 +45,20 @@ function joinCodeFromLocation() {
   const q = (params.get("join") || "").toUpperCase();
   const path = location.pathname.match(/\/join\/([A-Za-z]{4})/i);
   return (q || (path ? path[1] : "")).toUpperCase();
+}
+
+function inviteTokenFromLocation() {
+  return new URLSearchParams(location.search).get("invite") || "";
+}
+
+function joinUrlFor(s) {
+  return s.joinUrl || `${location.origin}/join/${s.code}`;
+}
+
+function safeQr(svg) {
+  const markup = String(svg || "").trim();
+  if (!markup.startsWith("<svg")) return "";
+  return markup;
 }
 
 async function api(path, { method = "GET", body } = {}) {
@@ -76,12 +93,79 @@ async function loadMeta() {
   }
 }
 
+function roomFingerprint(snap) {
+  if (!snap) return "";
+  return JSON.stringify({
+    phase: snap.phase,
+    roundNumber: snap.roundNumber,
+    code: snap.code,
+    canStart: snap.canStart,
+    remainingWordCount: snap.remainingWordCount,
+    usedWordCount: snap.usedWordCount,
+    numImposters: snap.numImposters,
+    discussSeconds: snap.discussSeconds,
+    passAndPlay: snap.passAndPlay,
+    wordsVisible: snap.wordsVisible,
+    words: snap.words,
+    usedWords: snap.usedWords,
+    speakerIndex: snap.speakerIndex,
+    discussEndsAt: snap.discussEndsAt,
+    players: snap.players,
+    invites: (snap.invites || []).map((inv) => [inv.token, inv.name, inv.claimed, inv.phoneMasked]),
+    you: snap.you,
+    result: snap.result,
+    joinUrl: snap.joinUrl,
+  });
+}
+
+function captureDrafts() {
+  const word = app.querySelector("#add-word [name=word]");
+  const inviteName = app.querySelector("#invite-form [name=name]");
+  const invitePhone = app.querySelector("#invite-form [name=phone]");
+  if (!word && !inviteName) return;
+  const active = document.activeElement;
+  const inApp = active && app.contains(active);
+  state.drafts = {
+    word: word ? word.value : state.drafts.word,
+    inviteName: inviteName ? inviteName.value : state.drafts.inviteName,
+    invitePhone: invitePhone ? invitePhone.value : state.drafts.invitePhone,
+    focus: inApp ? (active.getAttribute("name") || active.id || "") : "",
+    selStart: inApp && "selectionStart" in active ? active.selectionStart : null,
+    selEnd: inApp && "selectionEnd" in active ? active.selectionEnd : null,
+  };
+}
+
+function restoreDrafts() {
+  const drafts = state.drafts;
+  const word = app.querySelector("#add-word [name=word]");
+  if (word) word.value = drafts.word || "";
+  const inviteName = app.querySelector("#invite-form [name=name]");
+  if (inviteName) inviteName.value = drafts.inviteName || "";
+  const invitePhone = app.querySelector("#invite-form [name=phone]");
+  if (invitePhone) invitePhone.value = drafts.invitePhone || "";
+  if (!drafts.focus) return;
+  const focused = app.querySelector(`[name="${drafts.focus}"]`) || (drafts.focus && app.querySelector(`#${drafts.focus}`));
+  if (!focused) return;
+  focused.focus();
+  if (drafts.selStart == null || typeof focused.setSelectionRange !== "function") return;
+  try {
+    focused.setSelectionRange(drafts.selStart, drafts.selEnd ?? drafts.selStart);
+  } catch {
+    /* some inputs do not support a selection range */
+  }
+}
+
+let refreshInFlight = false;
+
 async function refresh() {
-  if (!state.token) return;
+  if (!state.token || refreshInFlight) return;
+  refreshInFlight = true;
   try {
     const snap = await api("/api/room");
-    const phaseChanged = state.snapshot && state.snapshot.phase !== snap.phase;
-    const roundChanged = state.snapshot && state.snapshot.roundNumber !== snap.roundNumber;
+    const phaseChanged = Boolean(state.snapshot && state.snapshot.phase !== snap.phase);
+    const roundChanged = Boolean(state.snapshot && state.snapshot.roundNumber !== snap.roundNumber);
+    const changed = roomFingerprint(state.snapshot) !== roomFingerprint(snap);
+    const hadError = Boolean(state.error);
     state.snapshot = snap;
     if (phaseChanged || roundChanged) {
       state.flipped = false;
@@ -89,21 +173,23 @@ async function refresh() {
       state.peek = null;
     }
     setError("");
-    render();
+    if (changed || phaseChanged || hadError) render();
   } catch (err) {
-    if (String(err.message).toLowerCase().includes("session") || String(err.message).toLowerCase().includes("join")) {
+    const message = String(err.message || "").toLowerCase();
+    if (message.includes("session expired") || message.includes("sign in to this room")) {
       setToken("");
       state.snapshot = null;
     }
     setError(err);
     render();
+  } finally {
+    refreshInFlight = false;
   }
 }
 
 async function act(fn) {
   if (state.busy) return;
   state.busy = true;
-  render();
   try {
     const result = await fn();
     if (result && result.token) setToken(result.token);
@@ -145,16 +231,22 @@ function playerRow(player, youId, extra = "", actions = "") {
 
 function renderHome() {
   const code = state.joinCode || joinCodeFromLocation();
-    app.innerHTML = `<section class="screen stack-lg">
+  const scanned = Boolean(code);
+  app.innerHTML = `<section class="screen stack-lg">
     ${toast()}
     <div class="hero">
-      <div class="kicker">Party game</div>
-      <h1 class="title">IMPOSTER</h1>
-      <p class="lede">Most of you share a secret word. Someone does not. Talk around it — then vote out the faker.</p>
+      <div class="kicker">${scanned ? "Scan received" : "Party game"}</div>
+      ${scanned ? `<div class="room-code">${esc(code)}</div><p class="lede">Enter your name to sit down at this table.</p>` : `<h1 class="title">IMPOSTER</h1><p class="lede">Most of you share a secret word. Someone does not. Talk around it — then vote out the faker.</p>`}
     </div>
     <label>Your name
       <input id="player-name" name="name" maxlength="24" autocomplete="nickname" value="${esc(state.name)}" placeholder="Maya" required />
     </label>
+    ${scanned ? `
+    <form id="join-form" class="stack panel">
+      <button class="btn" type="submit"${state.busy ? " disabled" : ""}>Join room ${esc(code)}</button>
+    </form>
+    <button class="linkish" id="not-this-room" type="button">Not this room</button>
+    ` : `
     <form id="create-form" class="stack panel">
       <button class="btn" type="submit"${state.busy ? " disabled" : ""}>Create a room</button>
     </form>
@@ -164,10 +256,11 @@ function renderHome() {
       </label>
       <button class="btn btn-ghost" type="submit"${state.busy ? " disabled" : ""}>Join room</button>
     </form>
+    `}
     <button class="linkish" id="how-toggle" type="button">${state.howTo ? "Hide how to play" : "How to play"}</button>
     ${state.howTo ? `<div class="panel"><ol class="how-list">
-      <li>One person creates a room and reads the 4-letter code (or shares the link).</li>
-      <li>Everyone else opens this page on their phone and joins.</li>
+      <li>One person creates a room. Everyone else scans the QR on that screen, or gets a text with a join link.</li>
+      <li>You can also type the 4-letter code if you already have the site open.</li>
       <li>The host adds a starter pack or types custom words. Words save for next time.</li>
       <li>Each player taps a private card: faithfuls see the word, imposters see a category.</li>
       <li>Take turns talking about the word without saying it. Imposters blend in.</li>
@@ -177,12 +270,20 @@ function renderHome() {
 
   app.querySelector("#how-toggle").onclick = () => {
     state.name = app.querySelector("#player-name")?.value || state.name;
-    state.joinCode = (app.querySelector("#join-code")?.value || state.joinCode).toUpperCase();
+    state.joinCode = (app.querySelector("#join-code")?.value || state.joinCode || code).toUpperCase();
     state.howTo = !state.howTo;
     render();
   };
+  const notThis = app.querySelector("#not-this-room");
+  if (notThis) notThis.onclick = () => {
+    state.joinCode = "";
+    state.inviteToken = "";
+    history.replaceState({}, "", "/");
+    render();
+  };
   const readName = () => app.querySelector("#player-name").value.trim();
-  app.querySelector("#create-form").onsubmit = (event) => {
+  const createForm = app.querySelector("#create-form");
+  if (createForm) createForm.onsubmit = (event) => {
     event.preventDefault();
     const name = readName();
     state.name = name;
@@ -192,11 +293,14 @@ function renderHome() {
   app.querySelector("#join-form").onsubmit = (event) => {
     event.preventDefault();
     const name = readName();
-    const joinCode = app.querySelector("#join-code").value.trim().toUpperCase();
+    const joinCode = (app.querySelector("#join-code")?.value || code).trim().toUpperCase();
     state.name = name;
     state.joinCode = joinCode;
     localStorage.setItem("imposter.name", name);
-    act(async () => api("/api/rooms/join", { method: "POST", body: { name, code: joinCode } }));
+    act(async () => api("/api/rooms/join", {
+      method: "POST",
+      body: { name, code: joinCode, inviteToken: state.inviteToken || undefined },
+    }));
   };
 }
 
@@ -260,20 +364,49 @@ function wordPanel(s) {
   </div>`;
 }
 
+function invitePanel(s) {
+  if (!s.you.isHost) return "";
+  const pending = (s.invites || []).filter((inv) => !inv.claimed);
+  const claimed = (s.invites || []).filter((inv) => inv.claimed);
+  const last = state.lastInvite;
+  return `<div class="panel stack">
+    <h3>Text a join link</h3>
+    <p class="hint">They tap the text, the game opens, and they sit down as that name.</p>
+    <form id="invite-form" class="stack">
+      <label>Name
+        <input name="name" maxlength="24" placeholder="Jordan" autocomplete="name" />
+      </label>
+      <label>Phone number
+        <input name="phone" type="tel" inputmode="tel" placeholder="5551234567" autocomplete="tel" />
+      </label>
+      <button class="btn" type="submit"${state.busy ? " disabled" : ""}>Send invite</button>
+    </form>
+    ${last ? `<p class="hint">${last.sent ? `Sent to ${esc(last.name)} via iMessage.` : `Invite saved for ${esc(last.name)}.`} ${last.smsUrl ? `<a class="linkish" href="${esc(last.smsUrl)}">Open Messages</a>` : ""}</p>` : ""}
+    ${pending.length ? `<div class="player-list">${pending.map((inv) => `<div class="player">
+      <div class="grow"><div class="player-name">${esc(inv.name)}</div><div class="player-meta">${esc(inv.phoneMasked)} · waiting</div></div>
+      ${inv.smsUrl ? `<a class="btn btn-ghost btn-small" href="${esc(inv.smsUrl)}">Text</a>` : ""}
+    </div>`).join("")}</div>` : ""}
+    ${claimed.length ? `<p class="muted">${claimed.map((inv) => esc(inv.name)).join(", ")} joined from a text.</p>` : ""}
+  </div>`;
+}
+
 function renderLobby() {
   const s = state.snapshot;
-  const url = `${location.origin}/join/${s.code}`;
+  const url = joinUrlFor(s);
+  const qr = safeQr(s.joinQrSvg);
   app.innerHTML = `<section class="screen stack-lg">
     ${toast()}
-    <div>
-      <div class="kicker">Room</div>
+    <div class="qr-wrap">
+      <div class="kicker">Scan to join</div>
+      <div class="qr-frame">${qr || `<p class="hint">Join link: ${esc(url)}</p>`}</div>
       <div class="room-code">${esc(s.code)}</div>
-      <p class="hint">Phones on this Wi-Fi: ${esc(url)}</p>
-      <div class="btn-row">
-        <button class="btn btn-ghost btn-small" id="copy-code" type="button">Copy code</button>
-        <button class="btn btn-ghost btn-small" id="copy-link" type="button">Copy join link</button>
-      </div>
+      <p class="hint">Same Wi-Fi. Camera app → tap the notification.</p>
     </div>
+    <div class="btn-row">
+      <button class="btn btn-ghost btn-small" id="copy-code" type="button">Copy code</button>
+      <button class="btn btn-ghost btn-small" id="copy-link" type="button">Copy join link</button>
+    </div>
+    ${invitePanel(s)}
     <div class="panel stack">
       <div class="spread"><h3>Players</h3><span class="muted">${s.players.length}</span></div>
       <div class="player-list">
@@ -299,7 +432,7 @@ function renderLobby() {
 }
 
 function bindLobby(s) {
-  const url = `${location.origin}/join/${s.code}`;
+  const url = joinUrlFor(s);
   const copy = async (text, btn) => {
     try {
       await navigator.clipboard.writeText(text);
@@ -313,6 +446,21 @@ function bindLobby(s) {
   if (copyCode) copyCode.onclick = () => copy(s.code, copyCode);
   const copyLink = app.querySelector("#copy-link");
   if (copyLink) copyLink.onclick = () => copy(url, copyLink);
+  const inviteForm = app.querySelector("#invite-form");
+  if (inviteForm) inviteForm.onsubmit = (event) => {
+    event.preventDefault();
+    const name = inviteForm.querySelector("[name=name]").value.trim();
+    const phone = inviteForm.querySelector("[name=phone]").value.trim();
+    act(async () => {
+      const result = await api("/api/room/invite", { method: "POST", body: { name, phone } });
+      state.lastInvite = {
+        name,
+        sent: Boolean(result.sent),
+        smsUrl: result.smsUrl,
+      };
+      return result;
+    });
+  };
   const start = app.querySelector("#start");
   if (start) start.onclick = () => act(() => api("/api/room/start", { method: "POST" }));
   const leave = app.querySelector("#leave");
@@ -586,14 +734,17 @@ function renderResults() {
 }
 
 function render() {
+  if (state.snapshot && state.snapshot.phase === "lobby") captureDrafts();
   const s = state.snapshot;
   if (!s) {
     renderHome();
     return;
   }
   const phase = s.phase;
-  if (phase === "lobby") renderLobby();
-  else if (phase === "reveal") renderReveal();
+  if (phase === "lobby") {
+    renderLobby();
+    restoreDrafts();
+  } else if (phase === "reveal") renderReveal();
   else if (phase === "discuss") renderDiscuss();
   else if (phase === "vote") renderVote();
   else if (phase === "results") renderResults();
@@ -606,9 +757,22 @@ let timerId = 0;
 function tickTimers() {
   clearInterval(timerId);
   timerId = setInterval(() => {
-    if (state.snapshot?.phase === "discuss" && state.snapshot.discussEndsAt) {
-      if (remainingMs(state.snapshot) === 0) refresh();
-      else if (!state.busy) renderDiscuss();
+    const snap = state.snapshot;
+    if (snap?.phase !== "discuss" || !snap.discussEndsAt) return;
+    const ms = remainingMs(snap);
+    if (ms === 0) {
+      refresh();
+      return;
+    }
+    const timer = app.querySelector(".timer");
+    const bar = app.querySelector(".bar > span");
+    if (!timer) return;
+    timer.textContent = formatMs(ms);
+    timer.classList.toggle("warn", ms < 15000);
+    if (bar) {
+      const total = (snap.discussSeconds || 0) * 1000;
+      const pct = !total ? 100 : Math.max(0, Math.round((ms / total) * 100));
+      bar.style.setProperty("--p", `${pct}%`);
     }
   }, 250);
 }
@@ -616,13 +780,31 @@ function tickTimers() {
 function startPolling() {
   clearInterval(pollId);
   pollId = setInterval(() => {
-    if (state.token && !state.busy) refresh();
-  }, 800);
+    if (state.token && !state.busy && !refreshInFlight) refresh();
+  }, 2000);
 }
 
 async function boot() {
   state.joinCode = joinCodeFromLocation();
+  state.inviteToken = inviteTokenFromLocation();
   await loadMeta();
+  if (state.inviteToken && !state.token) {
+    try {
+      const info = await api(`/api/invites/${encodeURIComponent(state.inviteToken)}`);
+      state.name = info.name;
+      state.joinCode = info.code;
+      localStorage.setItem("imposter.name", info.name);
+      const result = await api("/api/rooms/join", {
+        method: "POST",
+        body: { name: info.name, code: info.code, inviteToken: state.inviteToken },
+      });
+      setToken(result.token);
+      state.snapshot = result.room;
+      history.replaceState({}, "", `/join/${info.code}`);
+    } catch (err) {
+      setError(err);
+    }
+  }
   if (state.token) await refresh();
   else render();
   startPolling();

@@ -66,6 +66,15 @@ class Player:
     is_host: bool
     score: int = 0
     connected: bool = True
+    phone: str | None = None
+
+
+@dataclass
+class Invite:
+    token: str
+    name: str
+    phone: str
+    claimed_by: str | None = None
 
 
 @dataclass
@@ -100,12 +109,14 @@ class Room:
     round_number: int = 0
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
+    invites: dict[str, Invite] = field(default_factory=dict)
 
 
 class GameHub:
     def __init__(self, rng: random.Random | None = None) -> None:
         self.rooms: dict[str, Room] = {}
         self.token_index: dict[str, tuple[str, str]] = {}
+        self.invite_index: dict[str, str] = {}
         self.rng = rng or random.Random()
 
     def create_room(self, host_name: str) -> tuple[Room, Player]:
@@ -117,19 +128,71 @@ class GameHub:
         self.token_index[host.token] = (code, host.id)
         return room, host
 
-    def join_room(self, code: str, name: str) -> tuple[Room, Player]:
+    def join_room(
+        self,
+        code: str,
+        name: str,
+        invite_token: str | None = None,
+    ) -> tuple[Room, Player]:
         room = self._room(code)
-        cleaned = _clean_name(name)
+        invite = None
+        if invite_token:
+            invite = room.invites.get(invite_token.strip())
+            if invite is None:
+                raise GameError("That invite is no longer valid.")
+            if invite.claimed_by and invite.claimed_by in room.players:
+                raise GameError("That invite was already used.")
+        cleaned = _clean_name(name or (invite.name if invite else ""))
         taken = {p.name.casefold() for p in room.players.values()}
         if cleaned.casefold() in taken:
             raise GameError("That name is already in this room.")
         if len(room.players) >= 16:
             raise GameError("This room is full (16 players).")
-        player = Player(id=_new_id(), name=cleaned, token=_new_token(), is_host=False)
+        player = Player(
+            id=_new_id(),
+            name=cleaned,
+            token=_new_token(),
+            is_host=False,
+            phone=invite.phone if invite else None,
+        )
         room.players[player.id] = player
         self.token_index[player.token] = (room.code, player.id)
+        if invite:
+            invite.claimed_by = player.id
         self._touch(room)
         return room, player
+
+    def add_invite(self, room: Room, host: Player, name: str, phone: str) -> Invite:
+        self._require_host(host)
+        if room.phase not in ("lobby", "results"):
+            raise GameError("Invite people between rounds.")
+        cleaned_name = _clean_name(name)
+        cleaned_phone = (phone or "").strip()
+        if not cleaned_phone:
+            raise GameError("Enter a phone number.")
+        for existing in room.invites.values():
+            claimed_here = existing.claimed_by and existing.claimed_by in room.players
+            if existing.phone == cleaned_phone and (not existing.claimed_by or claimed_here):
+                raise GameError("That number already has an invite.")
+        invite = Invite(token=_new_token(), name=cleaned_name, phone=cleaned_phone)
+        room.invites[invite.token] = invite
+        self.invite_index[invite.token] = room.code
+        self._touch(room)
+        return invite
+
+    def lookup_invite(self, token: str) -> tuple[Room, Invite]:
+        code = self.invite_index.get((token or "").strip())
+        if not code:
+            raise GameError("That invite is no longer valid.", 404)
+        room = self.rooms.get(code)
+        if room is None:
+            raise GameError("That room has closed.", 404)
+        invite = room.invites.get(token.strip())
+        if invite is None:
+            raise GameError("That invite is no longer valid.", 404)
+        if invite.claimed_by and invite.claimed_by in room.players:
+            raise GameError("That invite was already used.")
+        return room, invite
 
     def resolve_token(self, token: str | None) -> tuple[Room, Player]:
         if not token:
@@ -419,6 +482,15 @@ class GameHub:
         if player.is_host:
             payload["words"] = list(room.remaining_words) if room.words_visible else []
             payload["usedWords"] = list(room.used_words) if room.words_visible else []
+            payload["invites"] = [
+                {
+                    "token": inv.token,
+                    "name": inv.name,
+                    "phone": inv.phone,
+                    "claimed": bool(inv.claimed_by and inv.claimed_by in room.players),
+                }
+                for inv in room.invites.values()
+            ]
         if rnd and room.phase == "results":
             payload["result"] = {
                 "word": rnd.word,
@@ -442,6 +514,8 @@ class GameHub:
             room = self.rooms.pop(code)
             for player in room.players.values():
                 self.token_index.pop(player.token, None)
+            for token in room.invites:
+                self.invite_index.pop(token, None)
 
     def _enter_discuss(self, room: Room, now: float | None = None) -> None:
         if room.round is None:

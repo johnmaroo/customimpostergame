@@ -164,6 +164,26 @@ class GameHubTests(unittest.TestCase):
             self.hub.start_round(room, ava)
         self.assertEqual(ctx.exception.status_code, 403)
 
+    def test_phone_invite_then_join_with_token(self) -> None:
+        room, host = self.hub.create_room("Host")
+        invite = self.hub.add_invite(room, host, "Jordan", "+15551234567")
+        looked, found = self.hub.lookup_invite(invite.token)
+        self.assertEqual(looked.code, room.code)
+        self.assertEqual(found.name, "Jordan")
+        _, jordan = self.hub.join_room(room.code, "Jordan", invite_token=invite.token)
+        self.assertEqual(jordan.phone, "+15551234567")
+        self.assertTrue(invite.claimed_by)
+        view = self.hub.view_for(room, host)
+        self.assertTrue(view["invites"][0]["claimed"])
+        with self.assertRaises(GameError):
+            self.hub.lookup_invite(invite.token)
+
+    def test_duplicate_invite_phone_rejected(self) -> None:
+        room, host = self.hub.create_room("Host")
+        self.hub.add_invite(room, host, "Ava", "+15550001111")
+        with self.assertRaises(GameError):
+            self.hub.add_invite(room, host, "Ben", "+15550001111")
+
 
 if __name__ == "__main__":
     unittest.main()

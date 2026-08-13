@@ -107,6 +107,7 @@ function roomFingerprint(snap) {
     passAndPlay: snap.passAndPlay,
     wordsVisible: snap.wordsVisible,
     irlMode: snap.irlMode,
+    imposterHints: snap.imposterHints,
     prompt: snap.prompt,
     words: snap.words,
     usedWords: snap.usedWords,
@@ -272,7 +273,7 @@ function renderHome() {
       <li>One person creates a room. Everyone else scans the QR on that screen, or gets a text with a join link.</li>
       <li>You can also type the 4-letter code if you already have the site open.</li>
       <li>Anyone can tap a starter pack or type a custom word. The list stays hidden. Words save for next time.</li>
-      <li>Each player taps a private card: faithfuls see the word, imposters see a broad category.</li>
+      <li>Each player taps a private card: faithfuls see the word. Imposters see a broad category unless the host turns hints off.</li>
       <li>Take turns on the same IRL prompt — a vibe, a reaction, a hot take — without naming the word.</li>
       <li>Vote. If the table names an imposter, the faithfuls score. If not, the imposters do.</li>
     </ol></div>` : ""}
@@ -325,7 +326,7 @@ function irlLabel(mode) {
 
 function settingsPanel(s) {
   if (!s.you.isHost) {
-    return `<div class="panel hint">${s.numImposters} imposter${s.numImposters === 1 ? "" : "s"} · ${s.discussSeconds ? s.discussSeconds + "s discussion" : "host-run discussion"} · ${esc(irlLabel(s.irlMode))}</div>`;
+    return `<div class="panel hint">${s.numImposters} imposter${s.numImposters === 1 ? "" : "s"} · ${s.discussSeconds ? s.discussSeconds + "s discussion" : "host-run discussion"} · ${esc(irlLabel(s.irlMode))}${s.imposterHints === false ? " · no category hints" : ""}</div>`;
   }
   return `<div class="panel stack">
     <div class="spread"><h3>Table rules</h3></div>
@@ -357,6 +358,10 @@ function settingsPanel(s) {
       </select>
     </label>
     <p class="hint">Same vague prompt for everyone. Talk around the category, not the details.</p>
+    <label class="toggle">Category hints at the start
+      <input id="imposter-hints" type="checkbox"${s.imposterHints !== false ? " checked" : ""} />
+    </label>
+    <p class="hint">Off: imposters only know they are the imposter. No category on the card.</p>
     <label class="toggle">Pass one phone around
       <input id="pass-play" type="checkbox"${s.passAndPlay ? " checked" : ""} />
     </label>
@@ -518,10 +523,11 @@ function bindLobby(s) {
         passAndPlay: app.querySelector("#pass-play").checked,
         wordsVisible: app.querySelector("#words-visible").checked,
         irlMode: app.querySelector("#irl-mode").value,
+        imposterHints: app.querySelector("#imposter-hints").checked,
       },
     }));
   };
-  ["#num-imposters", "#discuss-seconds", "#irl-mode", "#pass-play", "#words-visible"].forEach((sel) => {
+  ["#num-imposters", "#discuss-seconds", "#irl-mode", "#pass-play", "#words-visible", "#imposter-hints"].forEach((sel) => {
     const node = app.querySelector(sel);
     if (node) node.onchange = saveSettings;
   });
@@ -557,7 +563,7 @@ function roleFace(role) {
       <h2>You are the Imposter</h2>
       ${role.clue
         ? `<p class="lede">Talk around this category:</p><div class="secret-word">${esc(role.clue)}</div>`
-        : `<p class="lede">No category clue this round. Listen hard and blend in.</p>`}
+        : `<p class="lede">No category this round. Listen hard and blend in.</p>`}
     </div>`;
   }
   return `<div class="face face-back faithful">

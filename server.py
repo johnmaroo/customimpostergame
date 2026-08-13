@@ -94,6 +94,7 @@ class SettingsBody(BaseModel):
     passAndPlay: bool | None = None
     wordsVisible: bool | None = None
     irlMode: str | None = None
+    imposterHints: bool | None = None
 
 
 class VoteBody(BaseModel):
@@ -295,6 +296,7 @@ def settings(
             pass_and_play=body.passAndPlay,
             words_visible=body.wordsVisible,
             irl_mode=body.irlMode,
+            imposter_hints=body.imposterHints,
         )
         return _snapshot(room, player, request)
 
@@ -392,7 +394,10 @@ def start_round(
     with lock:
         room, player = hub.resolve_token(_token(authorization))
         rnd = hub.start_round(room, player, clue=None)
-        rnd.clue = _clue_for(rnd.word)
+        if room.imposter_hints:
+            rnd.clue = _clue_for(rnd.word)
+        else:
+            rnd.clue = None
         bank.mark_used(rnd.word)
         return _snapshot(room, player, request)
 

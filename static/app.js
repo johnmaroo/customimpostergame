@@ -886,6 +886,8 @@ function renderHuddle() {
   bindNextPrompt();
   bindEndGame();
 }
+
+function renderGuess() {
   const s = state.snapshot;
   const you = s.you;
   let body = "";

@@ -61,6 +61,109 @@ function safeQr(svg) {
   return markup;
 }
 
+function selectJoinUrl() {
+  const input = app.querySelector("#join-url");
+  if (!input) return null;
+  input.removeAttribute("readonly");
+  input.focus();
+  input.select();
+  input.setSelectionRange(0, input.value.length);
+  input.setAttribute("readonly", "");
+  return input;
+}
+
+function execCopyFrom(node, text) {
+  if (!node) return false;
+  const previous = node.value;
+  if (text != null && node.value !== text) node.value = text;
+  node.removeAttribute("readonly");
+  node.focus();
+  node.select();
+  node.setSelectionRange(0, node.value.length);
+  let ok = false;
+  try {
+    ok = document.execCommand("copy");
+  } catch {
+    ok = false;
+  }
+  node.setAttribute("readonly", "");
+  if (text != null && previous !== text) node.value = previous;
+  return ok;
+}
+
+function fallbackCopy(text) {
+  if (execCopyFrom(app.querySelector("#join-url"), text)) return true;
+  const field = document.createElement("textarea");
+  field.value = text;
+  field.setAttribute("readonly", "");
+  field.style.position = "fixed";
+  field.style.top = "0";
+  field.style.left = "0";
+  field.style.opacity = "0";
+  document.body.appendChild(field);
+  const ok = execCopyFrom(field, text);
+  document.body.removeChild(field);
+  return ok;
+}
+
+function markCopied(btn, copiedLabel) {
+  const previous = btn.textContent;
+  btn.textContent = copiedLabel || "Copied";
+  setTimeout(() => {
+    if (btn.isConnected) btn.textContent = previous;
+  }, 1600);
+}
+
+function onCopyClick(text, btn, copiedLabel) {
+  const finish = (ok) => {
+    if (ok) {
+      markCopied(btn, copiedLabel);
+      return;
+    }
+    selectJoinUrl();
+    btn.textContent = "Select the link below";
+  };
+
+  // LAN phones load this over http://192.168.x.x, which is not a secure
+  // context — clipboard.writeText is blocked. Copy in the same tap.
+  if (!window.isSecureContext || !navigator.clipboard?.writeText) {
+    finish(fallbackCopy(text));
+    return;
+  }
+  navigator.clipboard.writeText(text).then(
+    () => finish(true),
+    () => finish(fallbackCopy(text)),
+  );
+}
+
+function goHome() {
+  act(async () => {
+    try {
+      await api("/api/room/leave", { method: "POST" });
+    } catch {
+      /* already gone */
+    }
+    setToken("");
+    state.snapshot = null;
+    state.lastInvite = null;
+    return {};
+  });
+}
+
+function bindEndGame() {
+  const btn = app.querySelector("#end-game");
+  if (!btn) return;
+  btn.onclick = () => {
+    if (!window.confirm("End this game for everyone?")) return;
+    act(() => api("/api/room/end", { method: "POST" }));
+  };
+}
+
+function hostEndButton(s) {
+  if (!s.you.isHost) return "";
+  return `<button class="btn btn-ghost" id="end-game" type="button">End game</button>`;
+}
+
 async function api(path, { method = "GET", body } = {}) {
   const headers = { Accept: "application/json" };
   if (body !== undefined) headers["Content-Type"] = "application/json";
@@ -401,6 +504,9 @@ function renderLobby() {
       <div class="qr-frame">${qr || `<p class="hint">Join link: ${esc(url)}</p>`}</div>
       <div class="room-code">${esc(s.code)}</div>
       <p class="hint">Same Wi-Fi. Camera app → tap the notification.</p>
+      <label class="join-url-label">Join link
+        <input id="join-url" class="join-url" readonly value="${esc(url)}" />
+      </label>
     </div>
     <div class="btn-row">
       <button class="btn btn-ghost btn-small" id="copy-code" type="button">Copy code</button>
@@ -425,7 +531,8 @@ function renderLobby() {
         ? `<button class="btn" id="start"${s.canStart && !state.busy ? "" : " disabled"}>Start round ${s.roundNumber + 1}</button>
            <p class="hint">${s.canStart ? "Everyone should have their own screen face-down." : "Need 3 players, at least one word, and fewer imposters than players."}</p>`
         : `<p class="waiting">Waiting for ${esc(s.players.find((p) => p.isHost)?.name || "the host")} to start.</p>`}
-      <button class="btn btn-ghost" id="leave" type="button">Leave</button>
+      ${hostEndButton(s)}
+      <button class="btn btn-ghost" id="leave" type="button">${s.you.isHost ? "Leave table" : "Leave"}</button>
     </div>
   </section>`;
   bindLobby(s);
@@ -433,19 +540,16 @@ function renderLobby() {
 
 function bindLobby(s) {
   const url = joinUrlFor(s);
-  const copy = async (text, btn) => {
-    try {
-      await navigator.clipboard.writeText(text);
-      if (btn) btn.textContent = "Copied";
-    } catch {
-      setError(new Error("Copy failed — select it manually."));
-      render();
-    }
-  };
+  const joinUrlInput = app.querySelector("#join-url");
+  if (joinUrlInput) {
+    joinUrlInput.onclick = () => selectJoinUrl();
+    joinUrlInput.onfocus = () => selectJoinUrl();
+  }
   const copyCode = app.querySelector("#copy-code");
-  if (copyCode) copyCode.onclick = () => copy(s.code, copyCode);
+  if (copyCode) copyCode.onclick = () => onCopyClick(s.code, copyCode, "Copied");
   const copyLink = app.querySelector("#copy-link");
-  if (copyLink) copyLink.onclick = () => copy(url, copyLink);
+  if (copyLink) copyLink.onclick = () => onCopyClick(url, copyLink, "Copied");
+  bindEndGame();
   const inviteForm = app.querySelector("#invite-form");
   if (inviteForm) inviteForm.onsubmit = (event) => {
     event.preventDefault();
@@ -464,12 +568,7 @@ function bindLobby(s) {
   const start = app.querySelector("#start");
   if (start) start.onclick = () => act(() => api("/api/room/start", { method: "POST" }));
   const leave = app.querySelector("#leave");
-  if (leave) leave.onclick = () => act(async () => {
-    await api("/api/room/leave", { method: "POST" });
-    setToken("");
-    state.snapshot = null;
-    return {};
-  });
+  if (leave) leave.onclick = () => goHome();
   const saveSettings = () => {
     if (!s.you.isHost) return;
     act(() => api("/api/room/settings", {
@@ -566,7 +665,10 @@ function renderReveal() {
           `<button class="vote-btn" data-peek="${p.id}">${esc(p.name)}${p.ready ? " · seen" : ""}</button>`
         ).join("")}
       </div>
-      <button class="btn btn-ghost" id="advance" type="button">Everyone has seen it — discuss</button>
+      <div class="footer-actions">
+        <button class="btn btn-ghost" id="advance" type="button">Everyone has seen it — discuss</button>
+        ${hostEndButton(s)}
+      </div>
     </section>`;
     app.querySelectorAll("[data-peek]").forEach((btn) => {
       btn.onclick = () => act(() => api("/api/room/peek", { method: "POST", body: { playerId: btn.dataset.peek } }));
@@ -574,6 +676,7 @@ function renderReveal() {
     const hide = app.querySelector("#hide-peek");
     if (hide) hide.onclick = () => { state.peek = null; render(); };
     app.querySelector("#advance").onclick = () => act(() => api("/api/room/advance", { method: "POST" }));
+    bindEndGame();
     return;
   }
 
@@ -600,6 +703,7 @@ function renderReveal() {
     <div class="footer-actions">
       ${!state.hidden && showCard ? `<button class="btn" id="got-it" type="button">Got it — hide card</button>` : ""}
       ${s.you.isHost ? `<button class="btn btn-ghost" id="advance" type="button">Skip to discussion</button>` : ""}
+      ${hostEndButton(s)}
     </div>
   </section>`;
   const card = app.querySelector("#role-card");
@@ -615,6 +719,7 @@ function renderReveal() {
   };
   const advance = app.querySelector("#advance");
   if (advance) advance.onclick = () => act(() => api("/api/room/advance", { method: "POST" }));
+  bindEndGame();
 }
 
 function remainingMs(s) {
@@ -651,12 +756,14 @@ function renderDiscuss() {
     ${s.you.isHost ? `<div class="btn-row">
       <button class="btn btn-ghost" id="next-speaker" type="button">Next speaker</button>
       <button class="btn" id="advance" type="button">Start vote</button>
-    </div>` : `<p class="hint">Listen for your name in the speaking order.</p>`}
+    </div>
+    ${hostEndButton(s)}` : `<p class="hint">Listen for your name in the speaking order.</p>`}
   </section>`;
   const next = app.querySelector("#next-speaker");
   if (next) next.onclick = () => act(() => api("/api/room/next-speaker", { method: "POST" }));
   const advance = app.querySelector("#advance");
   if (advance) advance.onclick = () => act(() => api("/api/room/advance", { method: "POST" }));
+  bindEndGame();
 }
 
 function renderVote() {
@@ -675,6 +782,7 @@ function renderVote() {
     </div>
     <p class="hint">${s.players.filter((p) => p.inRound && p.hasVoted).length}/${s.players.filter((p) => p.inRound).length} voted</p>
     ${s.you.isHost ? `<button class="btn btn-ghost" id="advance" type="button">Close votes</button>` : ""}
+    ${hostEndButton(s)}
   </section>`;
   app.querySelectorAll("[data-vote]").forEach((btn) => {
     btn.onclick = () => act(() => api("/api/room/vote", {
@@ -684,6 +792,7 @@ function renderVote() {
   });
   const advance = app.querySelector("#advance");
   if (advance) advance.onclick = () => act(() => api("/api/room/advance", { method: "POST" }));
+  bindEndGame();
 }
 
 function voteLabel(s, playerId) {
@@ -723,7 +832,8 @@ function renderResults() {
     <div class="footer-actions">
       ${s.you.isHost
         ? `<button class="btn" id="start"${s.canStart && !state.busy ? "" : " disabled"}>${s.remainingWordCount ? "Next round" : "Need more words"}</button>
-           ${s.remainingWordCount ? "" : `<button class="btn btn-ghost" id="recycle" type="button">Put used words back</button>`}`
+           ${s.remainingWordCount ? "" : `<button class="btn btn-ghost" id="recycle" type="button">Put used words back</button>`}
+           ${hostEndButton(s)}`
         : `<p class="waiting">Waiting on the host.</p>`}
     </div>
   </section>`;
@@ -731,6 +841,34 @@ function renderResults() {
   if (start) start.onclick = () => act(() => api("/api/room/start", { method: "POST" }));
   const recycle = app.querySelector("#recycle");
   if (recycle) recycle.onclick = () => act(() => api("/api/room/words/recycle", { method: "POST" }));
+  bindEndGame();
+}
+
+function renderEnded() {
+  const s = state.snapshot;
+  const result = s.result || {};
+  app.innerHTML = `<section class="screen stack-lg">
+    ${toast()}
+    <div class="banner">
+      <div class="kicker">Game over</div>
+      <h2>Thanks for playing.</h2>
+      ${result.word ? `<p>The last word was <strong>${esc(result.word)}</strong></p>` : `<p class="lede">The host ended the game.</p>`}
+    </div>
+    <div class="panel stack">
+      <h3>Final scores</h3>
+      <div class="player-list">
+        ${s.players.map((p) => playerRow(p, s.you.id, p.wasImposter ? " · imposter" : "")).join("")}
+      </div>
+    </div>
+    <div class="footer-actions">
+      ${s.you.isHost ? `<button class="btn" id="reopen" type="button">Play again with this table</button>` : ""}
+      <button class="btn btn-ghost" id="leave" type="button">Back to home</button>
+    </div>
+  </section>`;
+  const reopen = app.querySelector("#reopen");
+  if (reopen) reopen.onclick = () => act(() => api("/api/room/reopen", { method: "POST" }));
+  const leave = app.querySelector("#leave");
+  if (leave) leave.onclick = () => goHome();
 }
 
 function render() {
@@ -748,6 +886,7 @@ function render() {
   else if (phase === "discuss") renderDiscuss();
   else if (phase === "vote") renderVote();
   else if (phase === "results") renderResults();
+  else if (phase === "ended") renderEnded();
   else renderLobby();
 }
 

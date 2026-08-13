@@ -477,7 +477,26 @@ a.linkish { display: inline; }
 
 .qr-wrap .kicker { color: #8a6a32; }
 .qr-wrap .room-code { color: #100c0a; padding: 0; letter-spacing: 0.22em; font-size: 2.1rem; }
-.qr-wrap .hint { color: #6d5c48; }
+.qr-wrap .join-url-label {
+  width: 100%;
+  color: #6d5c48;
+  font-size: 0.8rem;
+}
+
+.qr-wrap .join-url {
+  background: #fff;
+  color: #100c0a;
+  border: 1px solid rgba(16, 12, 10, 0.18);
+  letter-spacing: 0;
+  text-transform: none;
+  text-align: center;
+  font-size: 0.78rem;
+  padding: 10px 12px;
+  word-break: break-all;
+  user-select: all;
+  -webkit-user-select: all;
+  cursor: text;
+}
 
 .qr-frame {
   width: min(100%, 236px);

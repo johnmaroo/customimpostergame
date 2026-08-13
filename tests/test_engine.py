@@ -3,7 +3,13 @@ import random
 import time
 import unittest
 
-from engine import GameError, GameHub, MIN_PLAYERS
+from engine import (
+    GameError,
+    GameHub,
+    MIN_PLAYERS,
+    _deal_speaking_order,
+    _sample_by_fewest,
+)
 
 
 class GameHubTests(unittest.TestCase):
@@ -244,6 +250,128 @@ class GameHubTests(unittest.TestCase):
         room, host, _ava, _ben = self._table()
         with self.assertRaises(GameError):
             self.hub.set_settings(room, host, irl_mode="dares")
+
+
+class DealHelperTests(unittest.TestCase):
+    def test_fewest_skips_recent_when_everyone_is_tied(self) -> None:
+        rng = random.Random(0)
+        counts = {"a": 1, "b": 1, "c": 1}
+        picked = [
+            _sample_by_fewest(rng, ["a", "b", "c"], counts, 1, avoid=["a"])[0]
+            for _ in range(24)
+        ]
+        self.assertNotIn("a", picked)
+        self.assertEqual(set(picked), {"b", "c"})
+
+    def test_fewest_still_picks_whoever_is_behind(self) -> None:
+        rng = random.Random(0)
+        counts = {"a": 0, "b": 1, "c": 1}
+        choice = _sample_by_fewest(rng, ["a", "b", "c"], counts, 1, avoid=["a"])[0]
+        self.assertEqual(choice, "a")
+
+    def test_speaking_order_changes_starter_and_guest_tail(self) -> None:
+        rng = random.Random(1)
+        ids = ["h", "a", "b", "c"]
+        counts: dict[str, int] = {}
+        first = _deal_speaking_order(rng, ids, counts, previous=ids, last_starter=None)
+        counts[first[0]] = 1
+        second = _deal_speaking_order(
+            rng, ids, counts, previous=first, last_starter=first[0]
+        )
+        self.assertEqual(set(first), set(ids))
+        self.assertEqual(set(second), set(ids))
+        self.assertNotEqual(first, ids)
+        self.assertNotEqual(second[0], first[0])
+        self.assertNotEqual(first, second)
+
+
+class RoundDealTests(unittest.TestCase):
+    def _table(self, hub: GameHub, names: list[str], words: list[str]):
+        room, host = hub.create_room(names[0])
+        players = [host]
+        for name in names[1:]:
+            _, player = hub.join_room(room.code, name)
+            players.append(player)
+        for word in words:
+            hub.add_word(room, host, word)
+        return room, host, players
+
+    def _finish(self, hub: GameHub, room, host) -> None:
+        while room.phase not in ("results", "lobby"):
+            hub.advance(room, host)
+
+    def test_imposters_cycle_before_anyone_repeats(self) -> None:
+        for seed in range(20):
+            hub = GameHub(rng=random.Random(seed))
+            room, host, players = self._table(
+                hub, ["Host", "Ava", "Ben"], ["one", "two", "three"]
+            )
+            seen: list[str] = []
+            for _ in range(3):
+                rnd = hub.start_round(room, host)
+                self.assertEqual(len(rnd.imposter_ids), 1)
+                seen.append(rnd.imposter_ids[0])
+                self._finish(hub, room, host)
+            self.assertEqual(len(set(seen)), 3)
+            self.assertEqual(set(seen), {p.id for p in players})
+
+    def test_starter_cycles_before_anyone_repeats(self) -> None:
+        for seed in range(20):
+            hub = GameHub(rng=random.Random(seed))
+            room, host, players = self._table(
+                hub, ["Host", "Ava", "Ben"], ["one", "two", "three"]
+            )
+            starters: list[str] = []
+            for _ in range(3):
+                rnd = hub.start_round(room, host)
+                starters.append(rnd.speaking_order[0])
+                self._finish(hub, room, host)
+            self.assertEqual(len(set(starters)), 3)
+            self.assertEqual(set(starters), {p.id for p in players})
+
+    def test_speaking_order_is_a_fresh_permutation_each_round(self) -> None:
+        for seed in range(20):
+            hub = GameHub(rng=random.Random(seed))
+            room, host, players = self._table(
+                hub, ["Host", "Ava", "Ben", "Cara"], ["one", "two"]
+            )
+            join_ids = [p.id for p in players]
+            first = hub.start_round(room, host)
+            self.assertEqual(set(first.speaking_order), set(join_ids))
+            self.assertNotEqual(first.speaking_order, join_ids)
+            self._finish(hub, room, host)
+            second = hub.start_round(room, host)
+            self.assertEqual(set(second.speaking_order), set(join_ids))
+            self.assertNotEqual(second.speaking_order, first.speaking_order)
+            self.assertNotEqual(second.speaking_order[0], first.speaking_order[0])
+
+    def test_two_imposters_deal_the_other_pair_next(self) -> None:
+        for seed in range(15):
+            hub = GameHub(rng=random.Random(seed))
+            room, host, players = self._table(
+                hub, ["Host", "Ava", "Ben", "Cara"], ["one", "two"]
+            )
+            hub.set_settings(room, host, num_imposters=2)
+            first = hub.start_round(room, host)
+            self._finish(hub, room, host)
+            second = hub.start_round(room, host)
+            self.assertEqual(set(first.imposter_ids) & set(second.imposter_ids), set())
+            self.assertEqual(
+                set(first.imposter_ids) | set(second.imposter_ids),
+                {p.id for p in players},
+            )
+
+    def test_new_player_is_due_as_imposter(self) -> None:
+        hub = GameHub(rng=random.Random(0))
+        room, host, _players = self._table(
+            hub, ["Host", "Ava", "Ben"], ["one", "two", "three", "four"]
+        )
+        for _ in range(3):
+            hub.start_round(room, host)
+            self._finish(hub, room, host)
+        _, dana = hub.join_room(room.code, "Dana")
+        rnd = hub.start_round(room, host)
+        self.assertEqual(rnd.imposter_ids, [dana.id])
 
 
 if __name__ == "__main__":

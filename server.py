@@ -49,7 +49,7 @@ lock = threading.RLock()
 listen_port = 8765
 
 app = FastAPI(title="Imposter", docs_url=None, redoc_url=None)
-app.mount("/static", StaticFiles(directory=STATIC), name="static")
+app.mount("/static", StaticFiles(directory=STATIC, check_dir=False), name="static")
 
 
 def _cors_origins() -> list[str]:
@@ -471,7 +471,7 @@ def leave(authorization: str | None = Header(default=None)) -> dict[str, Any]:
 
 # Existing phone UI in static/. API routes stay first; Vercel promotes these
 # files to the CDN. python game.py still hosts laptop + phones on Wi-Fi.
-app.frontend("/", directory=str(STATIC), fallback="index.html")
+app.frontend("/", directory=str(STATIC), fallback="index.html", check_dir=False)
 
 
 def main() -> None:

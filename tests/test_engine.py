@@ -24,6 +24,13 @@ class GameHubTests(unittest.TestCase):
             self.hub.add_word(room, host, word)
         return room, host, ava, ben
 
+    def _advance_to(self, room, host, phase: str, now: float | None = None) -> None:
+        for _ in range(8):
+            if room.phase == phase:
+                return
+            self.hub.advance(room, host, now=now)
+        self.fail(f"expected phase {phase}, stuck at {room.phase}")
+
     def test_create_and_join_assigns_host(self) -> None:
         room, host = self.hub.create_room("  Maya  ")
         self.assertEqual(host.name, "Maya")
@@ -78,16 +85,16 @@ class GameHubTests(unittest.TestCase):
         import tempfile
         from pathlib import Path
 
+        from store import SqliteStore
+
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "rooms.json"
-            hub = GameHub(rng=random.Random(0), persist_path=path)
+            path = Path(tmp) / "rooms.db"
+            hub = GameHub(rng=random.Random(0), store=SqliteStore(path))
             room, host = hub.create_room("Host")
             hub.join_room(room.code, "Ava")
             hub.add_word(room, host, "Toaster")
-            code = room.code
             token = host.token
-            restored = GameHub(rng=random.Random(1), persist_path=path)
-            self.assertIn(code, restored.rooms)
+            restored = GameHub(rng=random.Random(1), store=SqliteStore(path))
             again, player = restored.resolve_token(token)
             self.assertEqual(player.name, "Host")
             self.assertEqual(again.remaining_words, ["Toaster"])
@@ -125,7 +132,7 @@ class GameHubTests(unittest.TestCase):
                 self.assertEqual(view["you"]["role"]["kind"], "imposter")
                 self.assertIsNone(view["you"]["role"]["word"])
                 self.assertNotIn("Telescope", blob)
-                self.assertEqual(view["you"]["role"]["clue"], "things for looking far away")
+                self.assertIsNone(view["you"]["role"]["clue"])
             else:
                 self.assertEqual(view["you"]["role"]["kind"], "faithful")
                 self.assertEqual(view["you"]["role"]["word"], "Telescope")
@@ -137,26 +144,25 @@ class GameHubTests(unittest.TestCase):
         for player in (host, ava, ben):
             self.hub.mark_ready(room, player)
         self.assertEqual(room.phase, "discuss")
-        self.assertIsNotNone(room.round.discuss_ends_at)
-        self.assertAlmostEqual(room.round.discuss_ends_at, time.time() + 60, delta=2)
+        self.assertIsNone(room.round.discuss_ends_at)
 
-    def test_timer_moves_to_vote(self) -> None:
+    def test_open_floor_timer_moves_to_guess(self) -> None:
         room, host, ava, ben = self._table(["Toaster"])
         self.hub.set_settings(room, host, discuss_seconds=45)
         self.hub.start_round(room, host, now=0)
         self.hub.advance(room, host, now=0)
         self.assertEqual(room.phase, "discuss")
+        self.hub.advance(room, host, now=0)
+        self.assertEqual(room.phase, "huddle")
         self.hub.tick(room, now=44)
-        self.assertEqual(room.phase, "discuss")
+        self.assertEqual(room.phase, "huddle")
         self.hub.tick(room, now=45)
-        self.assertEqual(room.phase, "vote")
+        self.assertEqual(room.phase, "guess")
 
     def test_cannot_vote_for_self(self) -> None:
         room, host, ava, _ben = self._table(["Toaster"])
         self.hub.start_round(room, host)
-        self.hub.advance(room, host)
-        self.hub.advance(room, host)
-        self.assertEqual(room.phase, "vote")
+        self._advance_to(room, host, "vote")
         with self.assertRaises(GameError):
             self.hub.vote(room, ava, ava.id)
 
@@ -164,8 +170,7 @@ class GameHubTests(unittest.TestCase):
         room, host, ava, ben = self._table(["Toaster"])
         rnd = self.hub.start_round(room, host)
         imposter_id = rnd.imposter_ids[0]
-        self.hub.advance(room, host)
-        self.hub.advance(room, host)
+        self._advance_to(room, host, "vote")
         for player in (host, ava, ben):
             target = None if player.id == imposter_id else imposter_id
             if target == player.id:
@@ -182,8 +187,7 @@ class GameHubTests(unittest.TestCase):
     def test_imposters_win_on_a_tie(self) -> None:
         room, host, ava, ben = self._table(["Toaster"])
         rnd = self.hub.start_round(room, host)
-        self.hub.advance(room, host)
-        self.hub.advance(room, host)
+        self._advance_to(room, host, "vote")
         imposter = next(p for p in (host, ava, ben) if p.id in rnd.imposter_ids)
         faithfuls = [p for p in (host, ava, ben) if p.id not in rnd.imposter_ids]
         self.hub.vote(room, faithfuls[0], faithfuls[1].id)
@@ -210,9 +214,7 @@ class GameHubTests(unittest.TestCase):
     def test_recycle_words(self) -> None:
         room, host, _ava, _ben = self._table(["Toaster"])
         self.hub.start_round(room, host)
-        self.hub.advance(room, host)
-        self.hub.advance(room, host)
-        self.hub.advance(room, host)
+        self._advance_to(room, host, "results")
         self.assertEqual(room.phase, "results")
         with self.assertRaises(GameError):
             self.hub.start_round(room, host)
@@ -281,6 +283,64 @@ class GameHubTests(unittest.TestCase):
         with self.assertRaises(GameError) as ctx:
             self.hub.reopen_lobby(room, ava)
         self.assertEqual(ctx.exception.status_code, 403)
+
+    def test_go_around_again_starts_a_new_lap(self) -> None:
+        room, host, ava, ben = self._table(["Toaster"])
+        self.hub.start_round(room, host)
+        self._advance_to(room, host, "discuss")
+        first = list(room.round.speaking_order)
+        self.hub.next_speaker(room, host)
+        self.hub.next_speaker(room, host)
+        self.assertEqual(room.round.speaker_index, 2)
+        self.hub.go_around_again(room, host)
+        self.assertEqual(room.phase, "discuss")
+        self.assertEqual(room.round.lap, 2)
+        self.assertEqual(room.round.speaker_index, 0)
+        self.assertEqual(room.round.speaking_order, first[1:] + first[:1])
+
+    def test_imposter_guesses_the_word_and_wins(self) -> None:
+        room, host, ava, ben = self._table(["Toaster"])
+        rnd = self.hub.start_round(room, host)
+        imposter = next(p for p in (host, ava, ben) if p.id in rnd.imposter_ids)
+        faithful = next(p for p in (host, ava, ben) if p.id not in rnd.imposter_ids)
+        self._advance_to(room, host, "guess")
+        view = self.hub.view_for(room, imposter)
+        self.assertTrue(view["you"]["canGuess"])
+        self.assertIsNone(view["you"]["role"]["clue"])
+        self.assertNotIn("Toaster", json.dumps(view))
+        with self.assertRaises(GameError):
+            self.hub.guess_word(room, faithful, "Toaster")
+        self.hub.guess_word(room, imposter, " toaster! ")
+        self.assertEqual(room.phase, "results")
+        self.assertEqual(room.round.winner, "imposters")
+        self.assertEqual(room.round.win_reason, "guess")
+        self.assertEqual(imposter.score, 4)
+        self.assertEqual(faithful.score, 0)
+        result = self.hub.view_for(room, faithful)["result"]
+        self.assertEqual(result["guessedBy"], imposter.id)
+        self.assertEqual(result["word"], "Toaster")
+
+    def test_wrong_guess_unlocks_clue_then_votes(self) -> None:
+        room, host, ava, ben = self._table(["Toaster"])
+        rnd = self.hub.start_round(room, host, clue="kitchen appliances")
+        imposter = next(p for p in (host, ava, ben) if p.id in rnd.imposter_ids)
+        self._advance_to(room, host, "guess")
+        self.hub.guess_word(room, imposter, "Sofa")
+        self.assertEqual(room.phase, "vote")
+        view = self.hub.view_for(room, imposter)
+        self.assertTrue(view["you"]["guessMissed"])
+        self.assertEqual(view["you"]["role"]["clue"], "kitchen appliances")
+        self.assertNotIn("Toaster", json.dumps({"role": view["you"]["role"]}))
+
+    def test_pass_and_play_skips_private_guess(self) -> None:
+        room, host, ava, ben = self._table(["Toaster"])
+        self.hub.set_settings(room, host, pass_and_play=True)
+        rnd = self.hub.start_round(room, host, clue="kitchen appliances")
+        imposter = next(p for p in (host, ava, ben) if p.id in rnd.imposter_ids)
+        self.assertEqual(self.hub.view_for(room, imposter)["you"]["role"]["clue"], "kitchen appliances")
+        self._advance_to(room, host, "huddle")
+        self.hub.advance(room, host)
+        self.assertEqual(room.phase, "vote")
 
     def test_round_deals_shared_irl_prompt(self) -> None:
         room, host, ava, ben = self._table(["Toaster"])

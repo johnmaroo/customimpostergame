@@ -6,6 +6,8 @@ venv/
 wordbank.db
 imposter-rooms.json
 *.db
+*.db-wal
+*.db-shm
 .pytest_cache/
 .DS_Store
 .vercel/

@@ -389,6 +389,12 @@ input:focus, select:focus {
   text-align: center;
 }
 
+.speaker.you {
+  border-style: solid;
+  border-color: var(--gold);
+  background: rgba(232, 195, 122, 0.08);
+}
+
 .prompt-card {
   padding: 18px 16px;
   border-radius: 20px;
@@ -415,7 +421,6 @@ input:focus, select:focus {
 }
 
 .prompt-card .btn-small { margin-top: 4px; }
-
 .speaker strong {
   display: block;
   font-size: 1.4rem;
@@ -460,6 +465,13 @@ input:focus, select:focus {
   border-radius: 14px;
   padding: 10px 12px;
   margin-bottom: 12px;
+}
+
+/* A blip is not an error: nobody has lost their seat. */
+.toast.notice {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--muted);
+  border-color: var(--line);
 }
 
 .how-list {

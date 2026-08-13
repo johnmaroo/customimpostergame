@@ -1,14 +1,18 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from fastapi.testclient import TestClient
 
 import server
-from engine import GameHub
+from engine import GameHub, StoreUnavailable
+from store import SqliteStore
 
 
 class ServerApiTests(unittest.TestCase):
     def setUp(self) -> None:
         server.hub = GameHub()
+        server.last_sweep = 0.0
         self.client = TestClient(server.app)
 
     def test_home_page_serves_ui(self) -> None:
@@ -144,6 +148,14 @@ class ServerApiTests(unittest.TestCase):
         self.assertNotEqual(swapped.json()["prompt"]["id"], discuss["prompt"]["id"])
 
         self.client.post("/api/room/advance", headers=auth(host["token"]))
+        huddle = self.client.get("/api/room", headers=auth(host["token"])).json()
+        self.assertEqual(huddle["phase"], "huddle")
+
+        self.client.post("/api/room/advance", headers=auth(host["token"]))
+        guess = self.client.get("/api/room", headers=auth(host["token"])).json()
+        self.assertEqual(guess["phase"], "guess")
+
+        self.client.post("/api/room/advance", headers=auth(host["token"]))
         vote_state = self.client.get("/api/room", headers=auth(host["token"])).json()
         self.assertEqual(vote_state["phase"], "vote")
         target = next(p["id"] for p in vote_state["players"] if p["id"] != host["playerId"])
@@ -241,6 +253,177 @@ class ServerApiTests(unittest.TestCase):
         self.assertEqual(fresh.status_code, 200)
         self.assertEqual(fresh.json()["you"]["name"], "Ava")
         self.assertEqual(fresh.json()["code"], code)
+
+
+class ReconnectTests(unittest.TestCase):
+    """The reported bug: a phone that waits too long is told its session died."""
+
+    def setUp(self) -> None:
+        self.dir = TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.db = Path(self.dir.name) / "rooms.db"
+        self.restart()
+        self.client = TestClient(server.app)
+
+    def restart(self) -> None:
+        """Stand in for a redeploy, a cold start, or a second instance."""
+        store = SqliteStore(self.db)
+        self.addCleanup(store.close)
+        server.hub = GameHub(store=store)
+        server.last_sweep = 0.0
+
+    def test_a_phone_picks_its_seat_back_up_after_a_restart(self) -> None:
+        host = self.client.post("/api/rooms", json={"name": "Host"}).json()
+        auth = {"Authorization": f"Bearer {host['token']}"}
+        self.client.post("/api/room/words", json={"word": "Toaster"}, headers=auth)
+
+        self.restart()
+
+        back = self.client.get("/api/room", headers=auth)
+        self.assertEqual(back.status_code, 200)
+        self.assertEqual(back.json()["code"], host["room"]["code"])
+        self.assertEqual(back.json()["remainingWordCount"], 1)
+        self.assertTrue(back.json()["you"]["isHost"])
+
+    def test_a_guest_who_takes_their_time_still_gets_in(self) -> None:
+        host = self.client.post("/api/rooms", json={"name": "Host"}).json()
+        code = host["room"]["code"]
+
+        self.restart()
+
+        joined = self.client.post("/api/rooms/join", json={"name": "Ava", "code": code})
+        self.assertEqual(joined.status_code, 200)
+        seen = self.client.get(
+            "/api/room", headers={"Authorization": f"Bearer {host['token']}"}
+        ).json()
+        self.assertEqual(sorted(p["name"] for p in seen["players"]), ["Ava", "Host"])
+
+    def test_a_texted_invite_outlives_a_restart(self) -> None:
+        host = self.client.post("/api/rooms", json={"name": "Host"}).json()
+        auth = {"Authorization": f"Bearer {host['token']}"}
+        invited = self.client.post(
+            "/api/room/invite",
+            json={"name": "Jordan", "phone": "5551234567"},
+            headers=auth,
+        ).json()
+
+        self.restart()
+
+        peeked = self.client.get(f"/api/invites/{invited['inviteToken']}")
+        self.assertEqual(peeked.status_code, 200)
+        self.assertEqual(peeked.json()["name"], "Jordan")
+
+    def test_a_round_in_progress_is_still_there(self) -> None:
+        host = self.client.post("/api/rooms", json={"name": "Host"}).json()
+        code = host["room"]["code"]
+        ava = self.client.post("/api/rooms/join", json={"name": "Ava", "code": code}).json()
+        self.client.post("/api/rooms/join", json={"name": "Ben", "code": code})
+        auth = {"Authorization": f"Bearer {host['token']}"}
+        self.client.post("/api/room/words/pack", json={"packId": "party"}, headers=auth)
+        started = self.client.post("/api/room/start", headers=auth).json()
+
+        self.restart()
+
+        guest = self.client.get(
+            "/api/room", headers={"Authorization": f"Bearer {ava['token']}"}
+        ).json()
+        self.assertEqual(guest["phase"], "reveal")
+        self.assertEqual(guest["roundNumber"], started["roundNumber"])
+        self.assertIn(guest["you"]["role"]["kind"], {"imposter", "faithful"})
+
+    def test_a_missed_guess_is_still_missed_after_a_restart(self) -> None:
+        host = self.client.post("/api/rooms", json={"name": "Host"}).json()
+        code = host["room"]["code"]
+        ava = self.client.post("/api/rooms/join", json={"name": "Ava", "code": code}).json()
+        ben = self.client.post("/api/rooms/join", json={"name": "Ben", "code": code}).json()
+        auth = lambda token: {"Authorization": f"Bearer {token}"}
+        self.client.post(
+            "/api/room/settings", json={"numImposters": 2}, headers=auth(host["token"])
+        )
+        self.client.post(
+            "/api/room/words/pack", json={"packId": "party"}, headers=auth(host["token"])
+        )
+        self.client.post("/api/room/start", headers=auth(host["token"]))
+        for _ in range(3):
+            self.client.post("/api/room/advance", headers=auth(host["token"]))
+        seats = {host["playerId"]: host, ava["playerId"]: ava, ben["playerId"]: ben}
+        guessing = self.client.get("/api/room", headers=auth(host["token"])).json()
+        self.assertEqual(guessing["phase"], "guess")
+        imposter = next(
+            seats[p["id"]]
+            for p in guessing["players"]
+            if self.client.get("/api/room", headers=auth(seats[p["id"]]["token"])).json()["you"][
+                "canGuess"
+            ]
+        )
+        missed = self.client.post(
+            "/api/room/guess", json={"word": "not it"}, headers=auth(imposter["token"])
+        )
+        self.assertEqual(missed.status_code, 200)
+
+        self.restart()
+
+        back = self.client.get("/api/room", headers=auth(imposter["token"])).json()
+        self.assertEqual(back["phase"], "guess")
+        self.assertTrue(back["you"]["hasGuessed"])
+        self.assertFalse(back["you"]["canGuess"])
+        spent = self.client.post(
+            "/api/room/guess", json={"word": "second try"}, headers=auth(imposter["token"])
+        )
+        self.assertEqual(spent.status_code, 400)
+
+    def test_a_lost_phone_sits_back_down_under_the_same_name(self) -> None:
+        host = self.client.post("/api/rooms", json={"name": "Host"}).json()
+        code = host["room"]["code"]
+        ava = self.client.post("/api/rooms/join", json={"name": "Ava", "code": code}).json()
+
+        self.restart()
+
+        again = self.client.post("/api/rooms/join", json={"name": "Ava", "code": code}).json()
+        self.assertEqual(again["playerId"], ava["playerId"])
+        self.assertNotEqual(again["token"], ava["token"])
+        stale = self.client.get("/api/room", headers={"Authorization": f"Bearer {ava['token']}"})
+        self.assertEqual(stale.status_code, 401)
+        self.assertEqual(stale.json()["code"], "not_seated")
+        fresh = self.client.get(
+            "/api/room", headers={"Authorization": f"Bearer {again['token']}"}
+        )
+        self.assertEqual(fresh.status_code, 200)
+        self.assertEqual(fresh.json()["you"]["name"], "Ava")
+
+    def test_an_unreachable_store_is_worth_retrying(self) -> None:
+        host = self.client.post("/api/rooms", json={"name": "Host"}).json()
+
+        class DownStore(SqliteStore):
+            def load(self, code: str):
+                raise StoreUnavailable("cache is down")
+
+        store = DownStore(self.db)
+        self.addCleanup(store.close)
+        server.hub = GameHub(store=store)
+
+        res = self.client.get(
+            "/api/room", headers={"Authorization": f"Bearer {host['token']}"}
+        )
+        self.assertEqual(res.status_code, 503)
+        self.assertEqual(res.json()["code"], "store_unavailable")
+
+    def test_errors_name_themselves_so_a_phone_knows_when_to_wait(self) -> None:
+        missing = self.client.get("/api/room")
+        self.assertEqual(missing.status_code, 401)
+        self.assertEqual(missing.json()["code"], "no_session")
+
+        garbled = self.client.get("/api/room", headers={"Authorization": "Bearer nonsense"})
+        self.assertEqual(garbled.status_code, 401)
+        self.assertEqual(garbled.json()["code"], "session_invalid")
+
+        host = self.client.post("/api/rooms", json={"name": "Host"}).json()
+        server.hub.store.delete(host["room"]["code"])
+        gone = self.client.get(
+            "/api/room", headers={"Authorization": f"Bearer {host['token']}"}
+        )
+        self.assertEqual(gone.status_code, 404)
+        self.assertEqual(gone.json()["code"], "room_closed")
 
 
 if __name__ == "__main__":

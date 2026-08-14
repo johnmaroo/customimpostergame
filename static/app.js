@@ -258,6 +258,10 @@ function dropSession() {
   state.snapshot = null;
   state.peek = null;
   state.lastInvite = null;
+  // Polling stops here, so calling it a reconnection would be a lie — and it
+  // would hide the reason we gave up behind the quiet notice.
+  missedPolls = 0;
+  state.offline = false;
 }
 
 let lastReclaimAt = 0;

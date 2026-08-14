@@ -542,6 +542,8 @@ class RoomStore(Protocol):
 class MemoryStore:
     """One process, one dict. LAN play and tests never leave this process."""
 
+    kind = "memory"
+
     def __init__(self) -> None:
         self.rooms: dict[str, Room] = {}
 

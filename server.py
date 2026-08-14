@@ -11,6 +11,7 @@ the same app can be connected to a Vercel project without replacing LAN play.
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import socket
 import threading
@@ -38,7 +39,7 @@ from notify import (
     sms_url,
 )
 from packs import get_pack, list_packs
-from store import create_store, room_ttl_seconds
+from store import create_store, describe_store, room_ttl_seconds
 from wordbank import WordBank
 
 ROOT = Path(__file__).resolve().parent
@@ -51,6 +52,11 @@ load_env_file()
 
 room_ttl = room_ttl_seconds()
 hub = GameHub(store=create_store(ttl_seconds=room_ttl), idle_seconds=room_ttl)
+room_store = describe_store(hub.store)
+if not room_store.shared:
+    # A table that only one instance can see closes at random for everyone
+    # else, which is impossible to diagnose from a phone.
+    logging.getLogger("imposter").warning("Rooms are not shared: %s", room_store.detail)
 bank = WordBank()
 lock = threading.RLock()
 listen_port = 8765
@@ -311,6 +317,11 @@ def meta(request: Request) -> dict[str, Any]:
         "packs": list_packs(),
         "joinOrigin": origin,
         "canIMessage": imessage_available(),
+        "roomStore": {
+            "kind": room_store.kind,
+            "shared": room_store.shared,
+            "detail": room_store.detail,
+        },
     }
 
 
@@ -620,6 +631,8 @@ def main() -> None:
     print(f"  Phones (Wi-Fi): http://{display_ip}:{args.port}")
     print("  Friends can scan the QR in the lobby or get a texted join link.")
     print("  Vercel is optional extra hosting — LAN play does not need it.\n")
+    if not room_store.shared:
+        print(f"  Heads up: {room_store.detail}\n")
     if not resolve_api_key():
         print("  Tip: add AI_GATEWAY_API_KEY to .env for custom-word category clues.")
         print("  Starter packs still include fallback categories.\n")

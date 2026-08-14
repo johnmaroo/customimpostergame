@@ -51,6 +51,13 @@ REDIS_ENV_PAIRS = (
     ("KV_REST_API_URL", "KV_REST_API_TOKEN"),
     ("UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN"),
 )
+# Redis providers that hand out an ordinary connection string instead, which is
+# the only thing on offer from some of them. One variable, no token beside it.
+REDIS_URL_ENV_KEYS = (
+    "IMPOSTER_REDIS_URL",
+    "REDIS_URL",
+    "KV_URL",
+)
 # Hosts that answer one request per instance and hand each instance its own
 # disk. A file-backed store there is private to whichever instance wrote it.
 FLEET_ENV_KEYS = (
@@ -115,6 +122,15 @@ def redis_rest_config() -> tuple[str, str] | None:
         token = (os.getenv(token_key) or "").strip()
         if url and token:
             return url, token
+    return None
+
+
+def redis_url_config() -> str | None:
+    """A ``redis://`` or ``rediss://`` connection string, if one was handed to us."""
+    for key in REDIS_URL_ENV_KEYS:
+        url = (os.getenv(key) or "").strip()
+        if url.startswith(("redis://", "rediss://")):
+            return url
     return None
 
 
@@ -287,6 +303,90 @@ class RedisRestStore:
         return body.get("result") if isinstance(body, dict) else None
 
 
+class RedisUrlStore:
+    """The same shared table, reached over an ordinary Redis connection.
+
+    Some providers only hand out a connection string, with no REST endpoint
+    beside it. The stored value and the version check match ``RedisRestStore``
+    exactly, so the two are interchangeable and a deployment can move between
+    them without stranding a table.
+    """
+
+    kind = "redis"
+
+    def __init__(
+        self,
+        url: str,
+        ttl_seconds: float | None = None,
+        client: Any = None,
+    ) -> None:
+        self.url = url
+        self.ttl_seconds = room_ttl_seconds() if ttl_seconds is None else ttl_seconds
+        self.client = client if client is not None else self._connect(url)
+
+    @staticmethod
+    def _connect(url: str) -> Any:
+        import redis
+
+        return redis.Redis.from_url(
+            url,
+            decode_responses=True,
+            socket_timeout=REDIS_TIMEOUT_SECONDS,
+            socket_connect_timeout=REDIS_TIMEOUT_SECONDS,
+            retry_on_timeout=True,
+        )
+
+    def load(self, code: str) -> Room | None:
+        raw = self._call(lambda: self.client.get(self._key(code)))
+        if not raw:
+            return None
+        version, _, payload = str(raw).partition("\n")
+        if not payload:
+            return None
+        room = room_from_dict(json.loads(payload))
+        room.version = int(version or 0)
+        return room
+
+    def save(self, room: Room) -> None:
+        expected = room.version
+        payload = f"{expected + 1}\n{json.dumps(room_to_dict(room))}"
+        ttl = int(self.ttl_seconds)
+        written = self._call(
+            lambda: self.client.eval(
+                _CAS_SCRIPT, 1, self._key(room.code), str(expected), payload, str(ttl)
+            )
+        )
+        if not int(written or 0):
+            raise StoreConflict(room.code)
+        room.version = expected + 1
+
+    def delete(self, code: str) -> None:
+        self._call(lambda: self.client.delete(self._key(code)))
+
+    def sweep(self, older_than: float) -> None:
+        """Redis expires idle rooms on its own; every write refreshes the TTL."""
+
+    def close(self) -> None:
+        try:
+            self.client.close()
+        except Exception:
+            pass
+
+    def _key(self, code: str) -> str:
+        return f"{ROOM_KEY_PREFIX}{code}"
+
+    def _call(self, work: Any) -> Any:
+        """Anything the connection itself refuses is 'cannot reach the table'."""
+        import redis
+
+        try:
+            return work()
+        except redis.RedisError as exc:
+            raise StoreUnavailable(str(exc)) from exc
+        except OSError as exc:
+            raise StoreUnavailable(str(exc)) from exc
+
+
 @dataclass(frozen=True)
 class StoreInfo:
     """What a table can expect from where it is being kept."""
@@ -314,8 +414,9 @@ def describe_store(store: RoomStore) -> StoreInfo:
             kind,
             False,
             "This host runs more than one copy of the game and gives each one its own "
-            "disk, so a table is only visible to the copy that created it. Add a Redis "
-            "cache (KV_REST_API_URL and KV_REST_API_TOKEN) to share tables.",
+            "disk, so a table is only visible to the copy that created it. Connect a "
+            "Redis store to share tables: the game reads REDIS_URL, or "
+            "KV_REST_API_URL with KV_REST_API_TOKEN.",
         )
     detail = "Tables are kept in memory and are lost when this process stops."
     if fleet:
@@ -330,22 +431,31 @@ def create_store(ttl_seconds: float | None = None) -> RoomStore:
     """Pick a room store from the environment.
 
     ``IMPOSTER_ROOM_STORE`` forces one of ``memory``, ``sqlite`` or ``redis``.
-    Left alone, a shared Redis cache wins when one is configured, otherwise
+    Left alone, a shared Redis store wins when one is configured, otherwise
     rooms go in the SQLite file, and a read-only filesystem falls back to
     memory so the game still runs.
+
+    Redis providers hand out either REST credentials or a connection string,
+    and which one you get depends on the provider rather than on any choice
+    made here. Both are accepted. REST is preferred where both exist: it is a
+    plain HTTPS call, so it does not hold a socket open per running copy.
     """
     ttl = room_ttl_seconds() if ttl_seconds is None else ttl_seconds
     kind = (os.getenv("IMPOSTER_ROOM_STORE") or "auto").strip().lower()
-    config = redis_rest_config()
+    rest = redis_rest_config()
+    url = redis_url_config()
 
     if kind == "memory":
         return MemoryStore()
-    if kind == "redis" or (kind == "auto" and config):
-        if not config:
-            raise RuntimeError(
-                "IMPOSTER_ROOM_STORE=redis needs KV_REST_API_URL and KV_REST_API_TOKEN."
-            )
-        return RedisRestStore(config[0], config[1], ttl_seconds=ttl)
+    if kind == "redis" or (kind == "auto" and (rest or url)):
+        if rest:
+            return RedisRestStore(rest[0], rest[1], ttl_seconds=ttl)
+        if url:
+            return RedisUrlStore(url, ttl_seconds=ttl)
+        raise RuntimeError(
+            "IMPOSTER_ROOM_STORE=redis needs REDIS_URL, or KV_REST_API_URL with "
+            "KV_REST_API_TOKEN."
+        )
     try:
         return SqliteStore(ttl_seconds=ttl)
     except (OSError, sqlite3.Error):

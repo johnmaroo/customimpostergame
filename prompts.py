@@ -1,8 +1,13 @@
-"""Shared IRL questions and actions for Imposter discussion turns.
+"""Shared prompts for Imposter discussion turns.
 
 Everyone at the table sees the same prompt, so answers can be compared.
 Prompts stay vague on purpose: opinion and vibe, not facts about the secret.
 That way an imposter with only a broad category can still take a turn.
+
+Prompts come in two styles. ``irl`` ones ask the table to react in the room —
+a face, a gesture, a hot take. ``classic`` ones are the plain questions of the
+original game: describe the thing without naming it. A table that wants one
+and not the other picks a mode below.
 """
 
 from __future__ import annotations
@@ -10,128 +15,83 @@ from __future__ import annotations
 from typing import Literal, TypedDict
 
 Kind = Literal["ask", "do"]
-IrlMode = Literal["off", "mix", "ask", "do"]
+Style = Literal["classic", "irl"]
+PromptMode = Literal["off", "classic", "mix", "ask", "do"]
 
-IRL_MODES: tuple[IrlMode, ...] = ("off", "mix", "ask", "do")
+PROMPT_MODES: tuple[PromptMode, ...] = ("off", "classic", "mix", "ask", "do")
+# Which prompts each mode draws from: the style it wants, and the kinds within it.
+MODE_POOLS: dict[str, tuple[Style, frozenset[Kind]]] = {
+    "classic": ("classic", frozenset({"ask"})),
+    "mix": ("irl", frozenset({"ask", "do"})),
+    "ask": ("irl", frozenset({"ask"})),
+    "do": ("irl", frozenset({"do"})),
+}
 
 
 class Prompt(TypedDict):
     id: str
     kind: Kind
+    style: Style
     text: str
     packs: tuple[str, ...] | None
 
 
-PROMPTS: tuple[Prompt, ...] = (
-    {
-        "id": "hot-take",
-        "kind": "ask",
-        "text": "Hot take, one sentence. Don't name it.",
-        "packs": None,
-    },
-    {
-        "id": "recommend",
-        "kind": "ask",
-        "text": "Would you recommend this kind of thing?",
-        "packs": None,
-    },
-    {
-        "id": "who-into",
-        "kind": "ask",
-        "text": "Who here is most into this? Point.",
-        "packs": None,
-    },
-    {
-        "id": "overrated",
-        "kind": "ask",
-        "text": "Overrated, underrated, or about right?",
-        "packs": None,
-    },
-    {
-        "id": "one-word",
-        "kind": "ask",
-        "text": "One-word reaction. Not its name.",
-        "packs": None,
-    },
-    {
-        "id": "you-thing",
-        "kind": "ask",
-        "text": "Is this a you thing, or not really?",
-        "packs": None,
-    },
-    {
-        "id": "vague-story",
-        "kind": "ask",
-        "text": "A short story about it. Keep it vague.",
-        "packs": None,
-    },
-    {
-        "id": "vibe-check",
-        "kind": "ask",
-        "text": "What's the vibe — chill, extra, or meh?",
-        "packs": None,
-    },
-    {
-        "id": "more-of-this",
-        "kind": "ask",
-        "text": "Would you want more of this in your life?",
-        "packs": None,
-    },
-    {
-        "id": "table-into",
-        "kind": "ask",
-        "text": "Does this table seem into it?",
-        "packs": None,
-    },
-    {
-        "id": "face",
-        "kind": "do",
-        "text": "React with only your face.",
-        "packs": None,
-    },
-    {
-        "id": "thumbs",
-        "kind": "do",
-        "text": "Thumbs up, sideways, or down.",
-        "packs": None,
-    },
-    {
-        "id": "point-who",
-        "kind": "do",
-        "text": "Point at who would be into this.",
-        "packs": None,
-    },
-    {
-        "id": "vibe-hands",
-        "kind": "do",
-        "text": "Show the vibe with your hands. Not the thing itself.",
-        "packs": None,
-    },
-    {
-        "id": "mime-feeling",
-        "kind": "do",
-        "text": "Mime how it feels, not what it is.",
-        "packs": None,
-    },
-    {
-        "id": "freeze",
-        "kind": "do",
-        "text": "Freeze in a reaction to it.",
-        "packs": None,
-    },
-    {
-        "id": "energy",
-        "kind": "do",
-        "text": "Big energy or small energy — just a gesture.",
-        "packs": None,
-    },
-    {
-        "id": "pass-vibe",
-        "kind": "do",
-        "text": "Send the vibe to the person on your right. No naming.",
-        "packs": None,
-    },
+def _deck(style: Style, rows: tuple[tuple[str, Kind, str], ...]) -> tuple[Prompt, ...]:
+    """Stamp a style onto one deck so a prompt cannot be filed under the wrong one."""
+    return tuple(
+        {"id": pid, "kind": kind, "style": style, "text": text, "packs": None}
+        for pid, kind, text in rows
+    )
+
+
+# The plain questions of the original game: say something true about the thing
+# without naming it. An imposter holding only a category can still bluff these.
+CLASSIC_PROMPTS: tuple[Prompt, ...] = _deck(
+    "classic",
+    (
+        ("classic-describe", "ask", "Describe it in one sentence without naming it."),
+        ("classic-how-often", "ask", "How often does this come up in your life?"),
+        ("classic-where", "ask", "Where would you expect to run into one?"),
+        ("classic-miss-it", "ask", "Would you miss it if it disappeared tomorrow?"),
+        ("classic-worth-it", "ask", "Is it worth what it costs?"),
+        ("classic-kid-knows", "ask", "Would a five-year-old know what this is?"),
+        ("classic-alone", "ask", "On your own, or with other people?"),
+        ("classic-time-of-day", "ask", "Morning, afternoon, or the middle of the night?"),
+        ("classic-how-long", "ask", "How long does it usually last?"),
+        ("classic-loud", "ask", "Loud or quiet?"),
+        ("classic-practice", "ask", "Does it take any practice to get right?"),
+        ("classic-last-time", "ask", "When was the last time, roughly?"),
+        ("classic-ten-years", "ask", "More common now than ten years ago, or less?"),
+        ("classic-first-word", "ask", "First word that comes to mind. Not its name."),
+    ),
 )
+
+# Reactions in the room: opinion, face, gesture. Nothing factual to leak.
+IRL_PROMPTS: tuple[Prompt, ...] = _deck(
+    "irl",
+    (
+        ("hot-take", "ask", "Hot take, one sentence. Don't name it."),
+        ("recommend", "ask", "Would you recommend this kind of thing?"),
+        ("who-into", "ask", "Who here is most into this? Point."),
+        ("overrated", "ask", "Overrated, underrated, or about right?"),
+        ("one-word", "ask", "One-word reaction. Not its name."),
+        ("you-thing", "ask", "Is this a you thing, or not really?"),
+        ("vague-story", "ask", "A short story about it. Keep it vague."),
+        ("vibe-check", "ask", "What's the vibe — chill, extra, or meh?"),
+        ("more-of-this", "ask", "Would you want more of this in your life?"),
+        ("table-into", "ask", "Does this table seem into it?"),
+        ("face", "do", "React with only your face."),
+        ("thumbs", "do", "Thumbs up, sideways, or down."),
+        ("point-who", "do", "Point at who would be into this."),
+        ("vibe-hands", "do", "Show the vibe with your hands. Not the thing itself."),
+        ("mime-feeling", "do", "Mime how it feels, not what it is."),
+        ("freeze", "do", "Freeze in a reaction to it."),
+        ("energy", "do", "Big energy or small energy — just a gesture."),
+        ("pass-vibe", "do", "Send the vibe to the person on your right. No naming."),
+    ),
+)
+
+PROMPTS: tuple[Prompt, ...] = CLASSIC_PROMPTS + IRL_PROMPTS
 
 
 def prompt_view(prompt: Prompt | None) -> dict[str, str] | None:
@@ -141,12 +101,13 @@ def prompt_view(prompt: Prompt | None) -> dict[str, str] | None:
 
 
 def eligible_prompts(mode: str, pack_id: str | None) -> list[Prompt]:
-    if mode not in ("mix", "ask", "do"):
+    pool_for = MODE_POOLS.get(mode)
+    if pool_for is None:
         return []
-    kinds = {"ask", "do"} if mode == "mix" else {mode}
+    style, kinds = pool_for
     pool: list[Prompt] = []
     for prompt in PROMPTS:
-        if prompt["kind"] not in kinds:
+        if prompt["style"] != style or prompt["kind"] not in kinds:
             continue
         packs = prompt["packs"]
         if packs and pack_id not in packs:

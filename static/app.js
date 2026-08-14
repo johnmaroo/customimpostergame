@@ -550,7 +550,7 @@ function renderHome() {
       <li>One person creates a room. Everyone else scans the QR, gets a text, or types the 4-letter code.</li>
       <li>Anyone can tap a starter pack or type a custom word. The list stays hidden. Words save for next time.</li>
       <li>Faithfuls see the word. Imposters do not at first. The host can turn category hints off entirely.</li>
-      <li>Take turns on the same IRL prompt without naming the word. The host can go around again.</li>
+      <li>Take turns on the same prompt without naming the word. The host can go around again.</li>
       <li>Then a short open floor to discuss. Imposters get one private guess — name the word and they win.</li>
       <li>If they miss, the table votes. Catch an imposter and the faithfuls score.</li>
     </ol></div>` : ""}
@@ -592,8 +592,9 @@ function renderHome() {
   };
 }
 
-function irlLabel(mode) {
+function promptModeLabel(mode) {
   return {
+    classic: "regular questions",
     mix: "IRL mix",
     ask: "IRL questions",
     do: "IRL actions",
@@ -603,7 +604,7 @@ function irlLabel(mode) {
 
 function settingsPanel(s) {
   if (!s.you.isHost) {
-    return `<div class="panel hint">${s.numImposters} imposter${s.numImposters === 1 ? "" : "s"} · ${s.discussSeconds ? s.discussSeconds + "s open floor" : "host-run open floor"} · ${esc(irlLabel(s.irlMode))}${s.imposterHints === false ? " · no category hints" : ""}</div>`;
+    return `<div class="panel hint">${s.numImposters} imposter${s.numImposters === 1 ? "" : "s"} · ${s.discussSeconds ? s.discussSeconds + "s open floor" : "host-run open floor"} · ${esc(promptModeLabel(s.irlMode))}${s.imposterHints === false ? " · no category hints" : ""}</div>`;
   }
   return `<div class="panel stack">
     <div class="spread"><h3>Table rules</h3></div>
@@ -625,17 +626,18 @@ function settingsPanel(s) {
       </select>
     </label>
     <p class="hint">After the speaking circle, a last moment to talk before imposters guess.</p>
-    <label>IRL turns
+    <label>Turn prompts
       <select id="irl-mode">
         ${[
-          ["mix", "Mix of questions & actions"],
-          ["ask", "Questions only"],
-          ["do", "Actions only"],
+          ["classic", "Regular questions about it"],
+          ["mix", "IRL mix of questions & actions"],
+          ["ask", "IRL questions only"],
+          ["do", "IRL actions only"],
           ["off", "Off — just talk"],
         ].map(([v, label]) => `<option value="${v}"${(s.irlMode || "mix") === v ? " selected" : ""}>${label}</option>`).join("")}
       </select>
     </label>
-    <p class="hint">Same vague prompt for everyone. Talk around the word, not the details.</p>
+    <p class="hint">Same prompt for everyone. Regular questions ask about the thing itself; IRL ones ask for a reaction in the room.</p>
     <label class="toggle">Category hints
       <input id="imposter-hints" type="checkbox"${s.imposterHints !== false ? " checked" : ""} />
     </label>

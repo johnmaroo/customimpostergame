@@ -14,7 +14,30 @@ class PromptDeckTests(unittest.TestCase):
     def test_kinds_are_ask_or_do(self) -> None:
         for prompt in PROMPTS:
             self.assertIn(prompt["kind"], {"ask", "do"})
+            self.assertIn(prompt["style"], {"classic", "irl"})
             self.assertTrue(prompt["text"].strip())
+
+    def test_classic_mode_asks_about_the_thing(self) -> None:
+        rng = random.Random(3)
+        for _ in range(20):
+            prompt = pick_prompt(rng, mode="classic")
+            self.assertIsNotNone(prompt)
+            self.assertEqual(prompt["style"], "classic")
+            self.assertEqual(prompt["kind"], "ask")
+
+    def test_irl_modes_never_deal_a_classic_question(self) -> None:
+        for mode in ("mix", "ask", "do"):
+            styles = {prompt["style"] for prompt in eligible_prompts(mode, None)}
+            self.assertEqual(styles, {"irl"}, mode)
+
+    def test_classic_mode_never_deals_an_action(self) -> None:
+        pool = eligible_prompts("classic", None)
+        self.assertTrue(pool)
+        self.assertEqual({prompt["kind"] for prompt in pool}, {"ask"})
+
+    def test_an_unknown_mode_deals_nothing(self) -> None:
+        self.assertEqual(eligible_prompts("dares", None), [])
+        self.assertIsNone(pick_prompt(random.Random(0), mode="dares"))
 
     def test_prompts_do_not_name_pack_words(self) -> None:
         secrets = []

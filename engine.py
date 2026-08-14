@@ -20,7 +20,7 @@ from collections import Counter
 from dataclasses import dataclass, field, fields
 from typing import Any, Literal, Protocol
 
-from prompts import IRL_MODES, pick_prompt, prompt_view
+from prompts import PROMPT_MODES, pick_prompt, prompt_view
 
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ"
 MIN_PLAYERS = 3
@@ -38,7 +38,7 @@ TOKEN_SEPARATOR = "."
 Phase = Literal["lobby", "reveal", "discuss", "huddle", "guess", "vote", "results", "ended"]
 Winner = Literal["faithfuls", "imposters"]
 WinReason = Literal["guess", "vote"]
-IrlMode = Literal["off", "mix", "ask", "do"]
+IrlMode = Literal["off", "classic", "mix", "ask", "do"]
 
 
 class GameError(Exception):
@@ -542,6 +542,8 @@ class RoomStore(Protocol):
 class MemoryStore:
     """One process, one dict. LAN play and tests never leave this process."""
 
+    kind = "memory"
+
     def __init__(self) -> None:
         self.rooms: dict[str, Room] = {}
 
@@ -736,8 +738,8 @@ class GameHub:
             room.words_visible = bool(words_visible)
         if irl_mode is not None:
             cleaned_mode = irl_mode.strip().lower()
-            if cleaned_mode not in IRL_MODES:
-                raise GameError("Pick an IRL turn style from the list.")
+            if cleaned_mode not in PROMPT_MODES:
+                raise GameError("Pick a prompt style from the list.")
             room.irl_mode = cleaned_mode  # type: ignore[assignment]
         if imposter_hints is not None:
             room.imposter_hints = bool(imposter_hints)
@@ -930,13 +932,13 @@ class GameHub:
             self._enter_vote(room)
 
     def next_prompt(self, room: Room, host: Player) -> dict[str, str] | None:
-        """Host swaps the shared IRL prompt during reveal, the circle, or open floor."""
+        """Host swaps the shared prompt during reveal, the circle, or open floor."""
         self._require_host(host)
         self.tick(room)
         if room.phase not in ("reveal", "discuss", "huddle") or room.round is None:
-            raise GameError("IRL prompts can change during reveal or discussion.")
+            raise GameError("Prompts can change during reveal or discussion.")
         if room.irl_mode == "off":
-            raise GameError("Turn on IRL turns to deal a prompt.")
+            raise GameError("Pick a prompt style to deal a prompt.")
         prompt = self._deal_prompt(room, room.round.word, extra_exclude={
             room.round.prompt["id"] if room.round.prompt else ""
         })

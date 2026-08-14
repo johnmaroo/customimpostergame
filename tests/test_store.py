@@ -24,7 +24,13 @@ from engine import (
     serialized_room_fields,
     serialized_round_fields,
 )
-from store import RedisRestStore, SqliteStore, create_store, room_ttl_seconds
+from store import (
+    RedisRestStore,
+    SqliteStore,
+    create_store,
+    describe_store,
+    room_ttl_seconds,
+)
 
 
 def played_room(hub: GameHub) -> tuple[Room, list]:
@@ -447,6 +453,66 @@ class StoreChoiceTests(unittest.TestCase):
             self.assertEqual(room_ttl_seconds(), 600)
         with patch.dict("os.environ", {"IMPOSTER_ROOM_TTL_SECONDS": "nonsense"}, clear=False):
             self.assertEqual(room_ttl_seconds(), store_module.ROOM_IDLE_SECONDS)
+
+
+NO_REDIS = {
+    "KV_REST_API_URL": "",
+    "KV_REST_API_TOKEN": "",
+    "UPSTASH_REDIS_REST_URL": "",
+    "UPSTASH_REDIS_REST_TOKEN": "",
+    "IMPOSTER_REDIS_REST_URL": "",
+    "IMPOSTER_REDIS_REST_TOKEN": "",
+}
+
+
+class SharingReportTests(unittest.TestCase):
+    """A store only one instance can read is why a table closes at random."""
+
+    def _sqlite(self, folder: str) -> SqliteStore:
+        return SqliteStore(Path(folder) / "rooms.db")
+
+    def test_a_file_is_shared_on_one_machine(self) -> None:
+        with TemporaryDirectory() as folder, patch.dict(
+            "os.environ", {**NO_REDIS, "IMPOSTER_MULTI_INSTANCE": "0", "VERCEL": ""}, clear=False
+        ):
+            store = self._sqlite(folder)
+            info = describe_store(store)
+            store.close()
+        self.assertEqual(info.kind, "sqlite")
+        self.assertTrue(info.shared)
+
+    def test_a_file_is_not_shared_across_a_fleet(self) -> None:
+        with TemporaryDirectory() as folder, patch.dict(
+            "os.environ", {**NO_REDIS, "VERCEL": "1"}, clear=False
+        ):
+            store = self._sqlite(folder)
+            info = describe_store(store)
+            store.close()
+        self.assertFalse(info.shared)
+        self.assertIn("own disk", info.detail)
+
+    def test_an_unknown_host_can_say_it_runs_more_than_one_copy(self) -> None:
+        with TemporaryDirectory() as folder, patch.dict(
+            "os.environ", {**NO_REDIS, "IMPOSTER_MULTI_INSTANCE": "yes"}, clear=False
+        ):
+            store = self._sqlite(folder)
+            info = describe_store(store)
+            store.close()
+        self.assertFalse(info.shared)
+
+    def test_a_cache_is_shared_wherever_it_runs(self) -> None:
+        with patch.dict("os.environ", {"VERCEL": "1"}, clear=False):
+            store = RedisRestStore("https://redis.example", "secret")
+            info = describe_store(store)
+            store.close()
+        self.assertEqual(info.kind, "redis")
+        self.assertTrue(info.shared)
+
+    def test_memory_never_survives_the_process(self) -> None:
+        with patch.dict("os.environ", {**NO_REDIS, "IMPOSTER_MULTI_INSTANCE": "0"}, clear=False):
+            info = describe_store(MemoryStore())
+        self.assertEqual(info.kind, "memory")
+        self.assertIn("lost when this process stops", info.detail)
 
 
 class SessionTokenTests(unittest.TestCase):

@@ -26,6 +26,7 @@ import os
 import sqlite3
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +50,15 @@ REDIS_ENV_PAIRS = (
     ("IMPOSTER_REDIS_REST_URL", "IMPOSTER_REDIS_REST_TOKEN"),
     ("KV_REST_API_URL", "KV_REST_API_TOKEN"),
     ("UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN"),
+)
+# Hosts that answer one request per instance and hand each instance its own
+# disk. A file-backed store there is private to whichever instance wrote it.
+FLEET_ENV_KEYS = (
+    "VERCEL",
+    "AWS_LAMBDA_FUNCTION_NAME",
+    "FUNCTIONS_WORKER_RUNTIME",
+    "K_SERVICE",
+    "FLY_ALLOC_ID",
 )
 
 _CAS_SCRIPT = """
@@ -85,6 +95,20 @@ def room_ttl_seconds() -> float:
     return seconds if seconds > 0 else float(ROOM_IDLE_SECONDS)
 
 
+def runs_as_a_fleet() -> bool:
+    """True when more than one copy of this app answers the same game.
+
+    ``IMPOSTER_MULTI_INSTANCE`` settles it either way for a host we do not
+    recognise, such as a container behind a load balancer.
+    """
+    explicit = (os.getenv("IMPOSTER_MULTI_INSTANCE") or "").strip().lower()
+    if explicit in {"1", "true", "yes", "on"}:
+        return True
+    if explicit in {"0", "false", "no", "off"}:
+        return False
+    return any((os.getenv(key) or "").strip() for key in FLEET_ENV_KEYS)
+
+
 def redis_rest_config() -> tuple[str, str] | None:
     for url_key, token_key in REDIS_ENV_PAIRS:
         url = (os.getenv(url_key) or "").strip().rstrip("/")
@@ -106,6 +130,8 @@ def default_room_db_path() -> Path:
 
 class SqliteStore:
     """A table survives a restart of the process that is hosting the game."""
+
+    kind = "sqlite"
 
     def __init__(self, db_path: str | Path | None = None, ttl_seconds: float | None = None) -> None:
         self.db_path = Path(db_path) if db_path is not None else default_room_db_path()
@@ -177,6 +203,8 @@ class SqliteStore:
 
 class RedisRestStore:
     """Every instance of a serverless deployment reads the same table."""
+
+    kind = "redis"
 
     def __init__(
         self,
@@ -257,6 +285,45 @@ class RedisRestStore:
         if response.status_code >= 400:
             raise StoreUnavailable(f"room store returned {response.status_code}")
         return body.get("result") if isinstance(body, dict) else None
+
+
+@dataclass(frozen=True)
+class StoreInfo:
+    """What a table can expect from where it is being kept."""
+
+    kind: str
+    shared: bool
+    detail: str
+
+
+def describe_store(store: RoomStore) -> StoreInfo:
+    """Report whether every instance answering this game sees the same tables.
+
+    A store that only one instance can read is the difference between a table
+    that stays open and one that closes at random, so it is worth saying out
+    loud rather than leaving it to be discovered mid-game.
+    """
+    kind = getattr(store, "kind", type(store).__name__)
+    if kind == "redis":
+        return StoreInfo(kind, True, "Tables are kept in a shared cache.")
+    fleet = runs_as_a_fleet()
+    if kind == "sqlite":
+        if not fleet:
+            return StoreInfo(kind, True, "Tables are kept in a file and survive a restart.")
+        return StoreInfo(
+            kind,
+            False,
+            "This host runs more than one copy of the game and gives each one its own "
+            "disk, so a table is only visible to the copy that created it. Add a Redis "
+            "cache (KV_REST_API_URL and KV_REST_API_TOKEN) to share tables.",
+        )
+    detail = "Tables are kept in memory and are lost when this process stops."
+    if fleet:
+        detail += (
+            " This host also runs more than one copy of the game, so a table is only "
+            "visible to the copy that created it."
+        )
+    return StoreInfo(kind, not fleet, detail)
 
 
 def create_store(ttl_seconds: float | None = None) -> RoomStore:

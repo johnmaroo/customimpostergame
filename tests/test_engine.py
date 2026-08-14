@@ -369,6 +369,38 @@ class GameHubTests(unittest.TestCase):
         rnd = self.hub.start_round(room, host)
         self.assertEqual(rnd.prompt["kind"], "ask")
 
+    def test_classic_mode_deals_a_regular_question(self) -> None:
+        from prompts import CLASSIC_PROMPTS
+
+        classic_ids = {prompt["id"] for prompt in CLASSIC_PROMPTS}
+        room, host, ava, ben = self._table(["Toaster"])
+        self.hub.set_settings(room, host, irl_mode="classic")
+        rnd = self.hub.start_round(room, host)
+        self.assertIn(rnd.prompt["id"], classic_ids)
+        self.assertEqual(rnd.prompt["kind"], "ask")
+        for player in (host, ava, ben):
+            view = self.hub.view_for(room, player)
+            self.assertEqual(view["irlMode"], "classic")
+            self.assertEqual(view["prompt"]["text"], rnd.prompt["text"])
+            if view["you"]["role"]["kind"] == "imposter":
+                self.assertNotIn("Toaster", json.dumps(view))
+
+    def test_classic_mode_survives_a_swap_and_a_reload(self) -> None:
+        from engine import room_from_dict, room_to_dict
+        from prompts import CLASSIC_PROMPTS
+
+        classic_ids = {prompt["id"] for prompt in CLASSIC_PROMPTS}
+        room, host, ava, ben = self._table(["Toaster"])
+        self.hub.set_settings(room, host, irl_mode="classic")
+        self.hub.start_round(room, host)
+        for player in (host, ava, ben):
+            self.hub.mark_ready(room, player)
+        swapped = self.hub.next_prompt(room, host)
+        self.assertIn(swapped["id"], classic_ids)
+        reloaded = room_from_dict(room_to_dict(room))
+        self.assertEqual(reloaded.irl_mode, "classic")
+        self.assertEqual(reloaded.round.prompt["id"], swapped["id"])
+
     def test_host_can_swap_prompt_during_discuss(self) -> None:
         room, host, ava, ben = self._table(["Toaster"])
         self.hub.start_round(room, host)

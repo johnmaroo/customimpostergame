@@ -1,12 +1,13 @@
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
 import server
 from engine import GameHub, StoreUnavailable
-from store import SqliteStore
+from store import SqliteStore, StoreInfo
 
 
 class ServerApiTests(unittest.TestCase):
@@ -74,6 +75,20 @@ class ServerApiTests(unittest.TestCase):
         ids = {pack["id"] for pack in res.json()["packs"]}
         self.assertIn("party", ids)
         self.assertIn("house", ids)
+
+    def test_meta_says_where_tables_are_kept(self) -> None:
+        store = self.client.get("/api/meta").json()["roomStore"]
+        self.assertEqual(set(store), {"kind", "shared", "detail"})
+        self.assertIsInstance(store["shared"], bool)
+        self.assertTrue(store["detail"].strip())
+
+    def test_meta_warns_a_host_whose_tables_are_not_shared(self) -> None:
+        """The host is the only one who can fix it, so the app has to be told."""
+        private = StoreInfo("sqlite", False, "Each copy of the game has its own disk.")
+        with patch.object(server, "room_store", private):
+            store = self.client.get("/api/meta").json()["roomStore"]
+        self.assertFalse(store["shared"])
+        self.assertIn("own disk", store["detail"])
 
     def test_create_room_includes_qr_and_join_url(self) -> None:
         created = self.client.post("/api/rooms", json={"name": "Host"})

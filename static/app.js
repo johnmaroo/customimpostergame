@@ -20,9 +20,13 @@ const state = {
 
 // A locked phone, a sleeping laptop, or a server catching its breath should
 // never cost you your seat. Only these say the seat itself is gone.
-const SEAT_LOST = new Set(["session_invalid", "not_seated", "no_session", "room_closed"]);
+const SEAT_LOST = new Set(["session_invalid", "not_seated", "no_session"]);
 // Of those, only these leave a table to sit back down at.
 const SEAT_RECLAIMABLE = new Set(["session_invalid", "not_seated"]);
+// "The table is gone" can be a lie: a server that just restarted, or one copy
+// of a deployment that never saw the table another copy is holding. Keep
+// asking for a while, because the next answer often has the game in it.
+const ROOM_GONE_GRACE_MS = 45000;
 const POLL_ACTIVE_MS = 2000;
 const POLL_RESTING_MS = 4000;
 const POLL_MAX_MS = 15000;
@@ -214,6 +218,18 @@ function seatIsLost(err) {
   return SEAT_LOST.has(err?.code);
 }
 
+// Timestamp of the first "no such table" in the current run of them.
+let roomGoneSince = 0;
+
+function roomLooksGone(err) {
+  return err?.code === "room_closed";
+}
+
+// Believe it only once the table has said the same thing for a while.
+function roomIsReallyGone() {
+  return roomGoneSince > 0 && Date.now() - roomGoneSince >= ROOM_GONE_GRACE_MS;
+}
+
 function setToken(token) {
   state.token = token || "";
   if (token) localStorage.setItem("imposter.token", token);
@@ -242,6 +258,10 @@ function dropSession() {
   state.snapshot = null;
   state.peek = null;
   state.lastInvite = null;
+  // Polling stops here, so calling it a reconnection would be a lie — and it
+  // would hide the reason we gave up behind the quiet notice.
+  missedPolls = 0;
+  state.offline = false;
 }
 
 let lastReclaimAt = 0;
@@ -361,6 +381,7 @@ let missedPolls = 0;
 
 function noteReachable() {
   missedPolls = 0;
+  roomGoneSince = 0;
   state.offline = false;
 }
 
@@ -389,10 +410,11 @@ async function refresh() {
     setError("");
     if (changed || phaseChanged || wasNoisy) render();
   } catch (err) {
-    if (seatIsLost(err)) {
+    if (seatIsLost(err) || (roomLooksGone(err) && roomIsReallyGone())) {
       await loseSeat(err);
     } else {
       // Keep the seat and the last view on screen; this is worth retrying.
+      if (roomLooksGone(err) && !roomGoneSince) roomGoneSince = Date.now();
       const wasOffline = state.offline;
       noteUnreachable();
       if (state.offline !== wasOffline || missedPolls === 1) render();
@@ -407,6 +429,7 @@ async function refresh() {
 async function loseSeat(err) {
   rememberSnapshot(state.snapshot);
   dropSession();
+  roomGoneSince = 0;
   if (SEAT_RECLAIMABLE.has(err.code)) {
     try {
       if (await reclaimSeat()) {
@@ -448,8 +471,15 @@ async function act(fn) {
     noteReachable();
     setError("");
   } catch (err) {
-    if (seatIsLost(err)) dropSession();
-    setError(err);
+    if (roomLooksGone(err) && !roomIsReallyGone()) {
+      // Same benefit of the doubt the poll gives: hold the seat and let the
+      // reconnecting notice speak instead of announcing a closed table.
+      if (!roomGoneSince) roomGoneSince = Date.now();
+      noteUnreachable();
+    } else {
+      if (seatIsLost(err)) dropSession();
+      setError(err);
+    }
   } finally {
     state.busy = false;
     render();
@@ -524,7 +554,7 @@ function renderHome() {
       <li>One person creates a room. Everyone else scans the QR, gets a text, or types the 4-letter code.</li>
       <li>Anyone can tap a starter pack or type a custom word. The list stays hidden. Words save for next time.</li>
       <li>Faithfuls see the word. Imposters do not at first. The host can turn category hints off entirely.</li>
-      <li>Take turns on the same IRL prompt without naming the word. The host can go around again.</li>
+      <li>Take turns on the same prompt without naming the word. The host can go around again.</li>
       <li>Then a short open floor to discuss. Imposters get one private guess — name the word and they win.</li>
       <li>If they miss, the table votes. Catch an imposter and the faithfuls score.</li>
     </ol></div>` : ""}
@@ -566,8 +596,9 @@ function renderHome() {
   };
 }
 
-function irlLabel(mode) {
+function promptModeLabel(mode) {
   return {
+    classic: "regular questions",
     mix: "IRL mix",
     ask: "IRL questions",
     do: "IRL actions",
@@ -577,7 +608,7 @@ function irlLabel(mode) {
 
 function settingsPanel(s) {
   if (!s.you.isHost) {
-    return `<div class="panel hint">${s.numImposters} imposter${s.numImposters === 1 ? "" : "s"} · ${s.discussSeconds ? s.discussSeconds + "s open floor" : "host-run open floor"} · ${esc(irlLabel(s.irlMode))}${s.imposterHints === false ? " · no category hints" : ""}</div>`;
+    return `<div class="panel hint">${s.numImposters} imposter${s.numImposters === 1 ? "" : "s"} · ${s.discussSeconds ? s.discussSeconds + "s open floor" : "host-run open floor"} · ${esc(promptModeLabel(s.irlMode))}${s.imposterHints === false ? " · no category hints" : ""}</div>`;
   }
   return `<div class="panel stack">
     <div class="spread"><h3>Table rules</h3></div>
@@ -599,17 +630,18 @@ function settingsPanel(s) {
       </select>
     </label>
     <p class="hint">After the speaking circle, a last moment to talk before imposters guess.</p>
-    <label>IRL turns
+    <label>Turn prompts
       <select id="irl-mode">
         ${[
-          ["mix", "Mix of questions & actions"],
-          ["ask", "Questions only"],
-          ["do", "Actions only"],
+          ["classic", "Regular questions about it"],
+          ["mix", "IRL mix of questions & actions"],
+          ["ask", "IRL questions only"],
+          ["do", "IRL actions only"],
           ["off", "Off — just talk"],
         ].map(([v, label]) => `<option value="${v}"${(s.irlMode || "mix") === v ? " selected" : ""}>${label}</option>`).join("")}
       </select>
     </label>
-    <p class="hint">Same vague prompt for everyone. Talk around the word, not the details.</p>
+    <p class="hint">Same prompt for everyone. Regular questions ask about the thing itself; IRL ones ask for a reaction in the room.</p>
     <label class="toggle">Category hints
       <input id="imposter-hints" type="checkbox"${s.imposterHints !== false ? " checked" : ""} />
     </label>
@@ -685,12 +717,24 @@ function invitePanel(s) {
   </div>`;
 }
 
+// Where this game is hosted decides whether a table stays open. Tell the host
+// before the round starts, not by closing the room on everyone halfway through.
+function sharingWarning(s) {
+  const store = state.meta?.roomStore;
+  if (!s.you.isHost || !store || store.shared !== false) return "";
+  return `<div class="panel warn stack">
+    <h3>This table may close on its own</h3>
+    <p class="hint">${esc(store.detail)}</p>
+  </div>`;
+}
+
 function renderLobby() {
   const s = state.snapshot;
   const url = joinUrlFor(s);
   const qr = safeQr(s.joinQrSvg);
   app.innerHTML = `<section class="screen stack-lg">
     ${toast()}
+    ${sharingWarning(s)}
     <div class="qr-wrap">
       <div class="kicker">Scan to join</div>
       <div class="qr-frame">${qr || `<p class="hint">Join link: ${esc(url)}</p>`}</div>

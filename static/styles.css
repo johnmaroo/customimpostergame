@@ -185,6 +185,14 @@ input:focus, select:focus {
   padding: 16px;
 }
 
+/* A setup problem the host can still fix, not a failure mid-game. */
+.panel.warn {
+  background: rgba(232, 195, 122, 0.09);
+  border-color: rgba(232, 195, 122, 0.34);
+}
+
+.panel.warn h3 { color: var(--gold); }
+
 .room-code {
   font-size: 2.6rem;
   letter-spacing: 0.28em;

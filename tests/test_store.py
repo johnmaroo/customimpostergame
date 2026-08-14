@@ -26,6 +26,7 @@ from engine import (
 )
 from store import (
     RedisRestStore,
+    RedisUrlStore,
     SqliteStore,
     create_store,
     describe_store,
@@ -403,6 +404,120 @@ class RealRedisTests(unittest.TestCase):
         self.assertIsNone(store.load(room.code))
 
 
+try:  # Optional: gives the Lua a real interpreter without a Redis to talk to.
+    import fakeredis
+except ImportError:  # pragma: no cover - depends on what is installed
+    fakeredis = None
+
+
+@unittest.skipUnless(fakeredis, "fakeredis is not installed")
+class LuaCompareAndSetTests(unittest.TestCase):
+    """Run the version check through an actual Lua interpreter.
+
+    The other suites reproduce the script's logic in Python, which proves the
+    store around it but would not catch a mistake inside the script itself.
+    """
+
+    def store(self, client) -> RedisUrlStore:
+        return RedisUrlStore("redis://fake", client=client)
+
+    def test_a_stale_write_is_refused_by_the_script(self) -> None:
+        client = fakeredis.FakeStrictRedis(decode_responses=True)
+        store = self.store(client)
+        hub = GameHub(store=store)
+        room, players = played_room(hub)
+        stale = self.store(client).load(room.code)
+
+        hub.advance(room, players[0])
+        with self.assertRaises(StoreConflict):
+            store.save(stale)
+        self.assertEqual(self.store(client).load(room.code).phase, "discuss")
+
+    def test_a_fresh_write_is_allowed_and_keeps_the_expiry(self) -> None:
+        client = fakeredis.FakeStrictRedis(decode_responses=True)
+        store = self.store(client)
+        hub = GameHub(store=store)
+        room, players = played_room(hub)
+
+        hub.advance(room, players[0])
+        left = client.ttl(f"imposter:room:{room.code}")
+        self.assertGreater(left, 0)
+        self.assertEqual(self.store(client).load(room.code).phase, "discuss")
+
+    def test_a_second_instance_reads_the_same_table(self) -> None:
+        client = fakeredis.FakeStrictRedis(decode_responses=True)
+        hub = GameHub(store=self.store(client))
+        room, players = played_room(hub)
+
+        other = GameHub(store=self.store(client))
+        seen_room, seen_player = other.resolve_token(players[1].token)
+        self.assertEqual(seen_room.code, room.code)
+        self.assertEqual(seen_player.name, "Ava")
+        self.assertEqual(seen_room.round.word, room.round.word)
+
+
+@unittest.skipUnless(redis_is_running(), "no Redis on 127.0.0.1:6379")
+class RealRedisUrlTests(unittest.TestCase):
+    """The connection-string path against a real server, Lua and all."""
+
+    def store(self, **kwargs) -> RedisUrlStore:
+        store = RedisUrlStore("redis://127.0.0.1:6379", **kwargs)
+        self.addCleanup(store.close)
+        return store
+
+    def test_two_instances_share_one_table(self) -> None:
+        store = self.store()
+        hub = GameHub(store=store)
+        room, players = played_room(hub)
+        self.addCleanup(store.delete, room.code)
+
+        other = GameHub(store=self.store())
+        seen_room, seen_player = other.resolve_token(players[1].token)
+        self.assertEqual(seen_room.code, room.code)
+        self.assertEqual(seen_player.name, "Ava")
+        self.assertEqual(seen_room.round.word, room.round.word)
+
+    def test_the_script_refuses_a_stale_write(self) -> None:
+        store = self.store()
+        hub = GameHub(store=store)
+        room, players = played_room(hub)
+        self.addCleanup(store.delete, room.code)
+        stale = self.store().load(room.code)
+
+        hub.advance(room, players[0])
+        with self.assertRaises(StoreConflict):
+            store.save(stale)
+        self.assertEqual(self.store().load(room.code).phase, "discuss")
+
+    def test_rooms_are_written_with_an_expiry(self) -> None:
+        store = self.store(ttl_seconds=900)
+        hub = GameHub(store=store)
+        room, _ = hub.create_room("Host")
+        self.addCleanup(store.delete, room.code)
+        left = store.client.ttl(f"imposter:room:{room.code}")
+        self.assertGreater(left, 0)
+        self.assertLessEqual(left, 900)
+
+    def test_a_rest_written_table_reads_back_over_a_connection(self) -> None:
+        """The two backends are the same table, not two encodings of one."""
+        wire = ResplessRedis()
+        self.addCleanup(wire.close)
+        rest = RedisRestStore(
+            "https://redis.example",
+            "token",
+            client=httpx.Client(transport=httpx.MockTransport(wire.handler)),
+        )
+        hub = GameHub(store=rest)
+        room, players = played_room(hub)
+        self.addCleanup(rest.delete, room.code)
+
+        over_url = GameHub(store=self.store())
+        seen_room, seen_player = over_url.resolve_token(players[1].token)
+        self.assertEqual(seen_room.code, room.code)
+        self.assertEqual(seen_room.round.word, room.round.word)
+        self.assertEqual(seen_player.name, "Ava")
+
+
 class StoreChoiceTests(unittest.TestCase):
     def test_memory_is_explicit(self) -> None:
         with patch.dict("os.environ", {"IMPOSTER_ROOM_STORE": "memory"}, clear=False):
@@ -417,6 +532,40 @@ class StoreChoiceTests(unittest.TestCase):
             store = create_store()
         self.assertIsInstance(store, RedisRestStore)
         store.close()
+
+    def test_a_connection_string_is_enough_on_its_own(self) -> None:
+        """Some providers hand out no REST endpoint at all."""
+        env = {**NO_REDIS, "REDIS_URL": "rediss://default:pw@redis.example:6379"}
+        with patch.dict("os.environ", env, clear=False):
+            store = create_store()
+        self.assertIsInstance(store, RedisUrlStore)
+
+    def test_rest_is_preferred_when_a_provider_offers_both(self) -> None:
+        """REST holds no socket open, which suits a host that runs many copies."""
+        env = {
+            "REDIS_URL": "rediss://default:pw@redis.example:6379",
+            "KV_REST_API_URL": "https://redis.example",
+            "KV_REST_API_TOKEN": "secret",
+        }
+        with patch.dict("os.environ", env, clear=False):
+            store = create_store()
+        self.assertIsInstance(store, RedisRestStore)
+        store.close()
+
+    def test_a_connection_string_that_is_not_one_is_ignored(self) -> None:
+        env = {**NO_REDIS, "REDIS_URL": "redis.example:6379"}
+        with TemporaryDirectory() as folder:
+            env["IMPOSTER_ROOM_DB_PATH"] = str(Path(folder) / "rooms.db")
+            with patch.dict("os.environ", env, clear=False):
+                store = create_store()
+            self.assertIsInstance(store, SqliteStore)
+            store.close()
+
+    def test_forcing_redis_without_any_credentials_is_refused(self) -> None:
+        env = {**NO_REDIS, "IMPOSTER_ROOM_STORE": "redis", "REDIS_URL": "", "KV_URL": ""}
+        with patch.dict("os.environ", env, clear=False), self.assertRaises(RuntimeError) as caught:
+            create_store()
+        self.assertIn("REDIS_URL", str(caught.exception))
 
     def test_redis_without_credentials_is_refused(self) -> None:
         env = {
@@ -453,6 +602,119 @@ class StoreChoiceTests(unittest.TestCase):
             self.assertEqual(room_ttl_seconds(), 600)
         with patch.dict("os.environ", {"IMPOSTER_ROOM_TTL_SECONDS": "nonsense"}, clear=False):
             self.assertEqual(room_ttl_seconds(), store_module.ROOM_IDLE_SECONDS)
+
+
+class FakeRedisClient:
+    """Enough of redis-py to exercise the connection-string store.
+
+    The Lua is not run; the check it performs is reproduced here so a stale
+    write is refused the same way a real server would refuse it.
+    """
+
+    def __init__(self, fail_with: Exception | None = None) -> None:
+        self.values: dict[str, str] = {}
+        self.expiries: dict[str, int] = {}
+        self.fail_with = fail_with
+        self.closed = False
+
+    def _maybe_fail(self) -> None:
+        if self.fail_with is not None:
+            raise self.fail_with
+
+    def get(self, key: str) -> str | None:
+        self._maybe_fail()
+        return self.values.get(key)
+
+    def eval(self, _script: str, _numkeys: int, key: str, expected: str, payload: str, ttl: str):
+        self._maybe_fail()
+        current = self.values.get(key)
+        if current is not None and int(current.split("\n", 1)[0]) != int(expected):
+            return 0
+        self.values[key] = payload
+        self.expiries[key] = int(ttl)
+        return 1
+
+    def delete(self, key: str) -> int:
+        self._maybe_fail()
+        self.values.pop(key, None)
+        return 1
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class RedisUrlStoreTests(unittest.TestCase):
+    """Some providers only offer a connection string, with no REST endpoint."""
+
+    def store(self, client: FakeRedisClient, **kwargs) -> RedisUrlStore:
+        return RedisUrlStore("rediss://default:pw@redis.example:6379", client=client, **kwargs)
+
+    def test_two_instances_share_one_table(self) -> None:
+        client = FakeRedisClient()
+        hub = GameHub(store=self.store(client))
+        room, players = played_room(hub)
+
+        other = GameHub(store=self.store(client))
+        seen_room, seen_player = other.resolve_token(players[1].token)
+        self.assertEqual(seen_room.code, room.code)
+        self.assertEqual(seen_player.name, "Ava")
+        self.assertEqual(seen_room.round.word, room.round.word)
+
+    def test_rooms_are_written_with_an_expiry(self) -> None:
+        client = FakeRedisClient()
+        hub = GameHub(store=self.store(client, ttl_seconds=900))
+        room, _ = hub.create_room("Host")
+        self.assertEqual(client.expiries[f"imposter:room:{room.code}"], 900)
+
+    def test_a_stale_writer_is_asked_to_retry(self) -> None:
+        client = FakeRedisClient()
+        store = self.store(client)
+        hub = GameHub(store=store)
+        room, players = played_room(hub)
+        stale = self.store(client).load(room.code)
+
+        hub.advance(room, players[0])
+        with self.assertRaises(StoreConflict):
+            store.save(stale)
+        self.assertEqual(self.store(client).load(room.code).phase, "discuss")
+
+    def test_a_deleted_table_reads_as_gone(self) -> None:
+        client = FakeRedisClient()
+        store = self.store(client)
+        hub = GameHub(store=store)
+        room, _ = hub.create_room("Host")
+        store.delete(room.code)
+        self.assertIsNone(store.load(room.code))
+
+    def test_an_unreachable_store_says_so(self) -> None:
+        import redis as redis_py
+
+        store = self.store(FakeRedisClient(fail_with=redis_py.ConnectionError("refused")))
+        with self.assertRaises(StoreUnavailable):
+            store.load("ABCD")
+
+    def test_a_dropped_socket_says_so_too(self) -> None:
+        store = self.store(FakeRedisClient(fail_with=OSError("broken pipe")))
+        with self.assertRaises(StoreUnavailable):
+            store.load("ABCD")
+
+    def test_the_two_backends_write_the_same_bytes(self) -> None:
+        """A deployment can move between REST and a connection string."""
+        rest_fake = FakeRedis()
+        rest = redis_store(rest_fake)
+        client = FakeRedisClient()
+        url = self.store(client)
+
+        room, _ = GameHub(store=rest).create_room("Host")
+        carried = GameHub(store=url)
+        carried.store.save(rest.load(room.code))
+
+        key = f"imposter:room:{room.code}"
+        written = json.loads(client.values[key].split("\n", 1)[1])
+        original = json.loads(rest_fake.values[key].split("\n", 1)[1])
+        # Everything but the version, which a second write is meant to move on.
+        self.assertEqual(written.pop("version"), original.pop("version") + 1)
+        self.assertEqual(written, original)
 
 
 NO_REDIS = {

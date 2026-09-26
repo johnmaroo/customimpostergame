@@ -17,6 +17,11 @@ Three backends share one small interface:
 ``create_store()`` picks one from the environment, and every backend degrades
 loudly (``StoreUnavailable``) instead of quietly starting a second, empty copy
 of the game.
+
+More than one game is hosted here, and they all want the same three backends.
+A ``RoomKind`` says how to turn one game's room into JSON and what to file it
+under, so the buzzer's rooms sit beside Imposter's without either being able
+to read — or overwrite — the other's four-letter code.
 """
 
 from __future__ import annotations
@@ -26,6 +31,7 @@ import os
 import sqlite3
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -45,6 +51,9 @@ from engine import (
 
 ROOM_KEY_PREFIX = "imposter:room:"
 REDIS_TIMEOUT_SECONDS = 4.0
+# A stored value starts "<version>\n". Room enough for a version nobody will
+# reach, so a watcher can read the number without the room hanging off it.
+VERSION_PREFIX_BYTES = 20
 # Upstash and Vercel KV both expose the same REST shape under different names.
 REDIS_ENV_PAIRS = (
     ("IMPOSTER_REDIS_REST_URL", "IMPOSTER_REDIS_REST_TOKEN"),
@@ -88,6 +97,49 @@ CREATE TABLE IF NOT EXISTS rooms (
 );
 CREATE INDEX IF NOT EXISTS rooms_last_seen ON rooms (last_seen);
 """
+
+
+@dataclass(frozen=True)
+class RoomKind:
+    """One game's rooms: what to file them under and how to write them down.
+
+    The prefix is part of the key in every backend, not just Redis, so two
+    games that both deal out four-letter codes can hand out the same one on
+    the same evening without colliding.
+    """
+
+    key_prefix: str
+    to_dict: Callable[[Any], dict[str, Any]]
+    from_dict: Callable[[dict[str, Any]], Any]
+
+    def key(self, code: str) -> str:
+        return f"{self.key_prefix}{code}"
+
+
+IMPOSTER_ROOMS = RoomKind(ROOM_KEY_PREFIX, room_to_dict, room_from_dict)
+
+
+def _leading_version(head: Any) -> int | None:
+    """Read the version off the front of a stored value, or None if it is gone."""
+    text = (head or "").strip() if isinstance(head, str) else ""
+    digits = text.partition("\n")[0].strip()
+    if not digits.isdigit():
+        return None
+    return int(digits)
+
+
+def version_of(store: RoomStore, code: str) -> int | None:
+    """Ask a store for a room's version, however cheaply it can answer.
+
+    Every backend here can do this without reading the room, but the protocol
+    only promises ``load``, so a store that cannot is read the slow way rather
+    than left out.
+    """
+    cheap = getattr(store, "version_of", None)
+    if cheap is not None:
+        return cheap(code)
+    room = store.load(code)
+    return None if room is None else room.version
 
 
 def room_ttl_seconds() -> float:
@@ -149,9 +201,15 @@ class SqliteStore:
 
     kind = "sqlite"
 
-    def __init__(self, db_path: str | Path | None = None, ttl_seconds: float | None = None) -> None:
+    def __init__(
+        self,
+        db_path: str | Path | None = None,
+        ttl_seconds: float | None = None,
+        rooms: RoomKind = IMPOSTER_ROOMS,
+    ) -> None:
         self.db_path = Path(db_path) if db_path is not None else default_room_db_path()
         self.ttl_seconds = room_ttl_seconds() if ttl_seconds is None else ttl_seconds
+        self.rooms = rooms
         self._lock = threading.RLock()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=5.0)
@@ -168,33 +226,43 @@ class SqliteStore:
     def load(self, code: str) -> Room | None:
         with self._lock:
             row = self.conn.execute(
-                "SELECT version, last_seen, data FROM rooms WHERE code = ?", (code,)
+                "SELECT version, last_seen, data FROM rooms WHERE code = ?",
+                (self.rooms.key(code),),
             ).fetchone()
         if row is None:
             return None
         if row["last_seen"] < time.time() - self.ttl_seconds:
             self.delete(code)
             return None
-        room = room_from_dict(json.loads(row["data"]))
+        room = self.rooms.from_dict(json.loads(row["data"]))
         room.version = int(row["version"])
         return room
 
+    def version_of(self, code: str) -> int | None:
+        """The version alone, for a caller watching a room for a change."""
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT version FROM rooms WHERE code = ?", (self.rooms.key(code),)
+            ).fetchone()
+        return None if row is None else int(row["version"])
+
     def save(self, room: Room) -> None:
         expected = room.version
-        payload = json.dumps(room_to_dict(room))
+        key = self.rooms.key(room.code)
+        payload = json.dumps(self.rooms.to_dict(room))
         with self._lock, self.conn:
             updated = self.conn.execute(
                 "UPDATE rooms SET version = ?, last_seen = ?, data = ? "
                 "WHERE code = ? AND version = ?",
-                (expected + 1, room.last_seen_at, payload, room.code, expected),
+                (expected + 1, room.last_seen_at, payload, key, expected),
             )
             if updated.rowcount == 0:
-                if self._exists(room.code):
+                if self._exists(key):
                     raise StoreConflict(room.code)
                 try:
                     self.conn.execute(
                         "INSERT INTO rooms (code, version, last_seen, data) VALUES (?, ?, ?, ?)",
-                        (room.code, expected + 1, room.last_seen_at, payload),
+                        (key, expected + 1, room.last_seen_at, payload),
                     )
                 except sqlite3.IntegrityError as exc:
                     raise StoreConflict(room.code) from exc
@@ -202,7 +270,7 @@ class SqliteStore:
 
     def delete(self, code: str) -> None:
         with self._lock, self.conn:
-            self.conn.execute("DELETE FROM rooms WHERE code = ?", (code,))
+            self.conn.execute("DELETE FROM rooms WHERE code = ?", (self.rooms.key(code),))
 
     def sweep(self, older_than: float) -> None:
         with self._lock, self.conn:
@@ -212,8 +280,8 @@ class SqliteStore:
         with self._lock:
             self.conn.close()
 
-    def _exists(self, code: str) -> bool:
-        row = self.conn.execute("SELECT 1 FROM rooms WHERE code = ?", (code,)).fetchone()
+    def _exists(self, key: str) -> bool:
+        row = self.conn.execute("SELECT 1 FROM rooms WHERE code = ?", (key,)).fetchone()
         return row is not None
 
 
@@ -228,9 +296,11 @@ class RedisRestStore:
         token: str,
         ttl_seconds: float | None = None,
         client: httpx.Client | None = None,
+        rooms: RoomKind = IMPOSTER_ROOMS,
     ) -> None:
         self.url = url.rstrip("/")
         self.ttl_seconds = room_ttl_seconds() if ttl_seconds is None else ttl_seconds
+        self.rooms = rooms
         self.client = client or httpx.Client(timeout=REDIS_TIMEOUT_SECONDS)
         self._headers = {"Authorization": f"Bearer {token}"}
         self._compare_and_set = True
@@ -242,9 +312,19 @@ class RedisRestStore:
         version, _, payload = str(raw).partition("\n")
         if not payload:
             return None
-        room = room_from_dict(json.loads(payload))
+        room = self.rooms.from_dict(json.loads(payload))
         room.version = int(version or 0)
         return room
+
+    def version_of(self, code: str) -> int | None:
+        """Read back only the version line, not the whole room.
+
+        A caller watching for a change asks several times a second, and the
+        version sits at the front of the value, so there is no reason to pull
+        the entire table across the wire each time.
+        """
+        head = self._command(["GETRANGE", self._key(code), "0", str(VERSION_PREFIX_BYTES)])
+        return _leading_version(head)
 
     def save(self, room: Room) -> None:
         """Write the room, refusing the write if another instance got there first.
@@ -254,7 +334,7 @@ class RedisRestStore:
         nobody can reach.
         """
         expected = room.version
-        payload = f"{expected + 1}\n{json.dumps(room_to_dict(room))}"
+        payload = f"{expected + 1}\n{json.dumps(self.rooms.to_dict(room))}"
         ttl = str(int(self.ttl_seconds))
         if self._compare_and_set:
             written = self._command(
@@ -282,7 +362,7 @@ class RedisRestStore:
         self._compare_and_set = False
 
     def _key(self, code: str) -> str:
-        return f"{ROOM_KEY_PREFIX}{code}"
+        return self.rooms.key(code)
 
     def _command(self, parts: list[Any], on_script_error: Any = None) -> Any:
         try:
@@ -319,9 +399,11 @@ class RedisUrlStore:
         url: str,
         ttl_seconds: float | None = None,
         client: Any = None,
+        rooms: RoomKind = IMPOSTER_ROOMS,
     ) -> None:
         self.url = url
         self.ttl_seconds = room_ttl_seconds() if ttl_seconds is None else ttl_seconds
+        self.rooms = rooms
         self.client = client if client is not None else self._connect(url)
 
     @staticmethod
@@ -343,13 +425,20 @@ class RedisUrlStore:
         version, _, payload = str(raw).partition("\n")
         if not payload:
             return None
-        room = room_from_dict(json.loads(payload))
+        room = self.rooms.from_dict(json.loads(payload))
         room.version = int(version or 0)
         return room
 
+    def version_of(self, code: str) -> int | None:
+        """Only the version line, for a caller watching this room for a change."""
+        head = self._call(
+            lambda: self.client.getrange(self._key(code), 0, VERSION_PREFIX_BYTES)
+        )
+        return _leading_version(head)
+
     def save(self, room: Room) -> None:
         expected = room.version
-        payload = f"{expected + 1}\n{json.dumps(room_to_dict(room))}"
+        payload = f"{expected + 1}\n{json.dumps(self.rooms.to_dict(room))}"
         ttl = int(self.ttl_seconds)
         written = self._call(
             lambda: self.client.eval(
@@ -373,7 +462,7 @@ class RedisUrlStore:
             pass
 
     def _key(self, code: str) -> str:
-        return f"{ROOM_KEY_PREFIX}{code}"
+        return self.rooms.key(code)
 
     def _call(self, work: Any) -> Any:
         """Anything the connection itself refuses is 'cannot reach the table'."""
@@ -427,7 +516,7 @@ def describe_store(store: RoomStore) -> StoreInfo:
     return StoreInfo(kind, not fleet, detail)
 
 
-def create_store(ttl_seconds: float | None = None) -> RoomStore:
+def create_store(ttl_seconds: float | None = None, rooms: RoomKind = IMPOSTER_ROOMS) -> RoomStore:
     """Pick a room store from the environment.
 
     ``IMPOSTER_ROOM_STORE`` forces one of ``memory``, ``sqlite`` or ``redis``.
@@ -449,15 +538,15 @@ def create_store(ttl_seconds: float | None = None) -> RoomStore:
         return MemoryStore()
     if kind == "redis" or (kind == "auto" and (rest or url)):
         if rest:
-            return RedisRestStore(rest[0], rest[1], ttl_seconds=ttl)
+            return RedisRestStore(rest[0], rest[1], ttl_seconds=ttl, rooms=rooms)
         if url:
-            return RedisUrlStore(url, ttl_seconds=ttl)
+            return RedisUrlStore(url, ttl_seconds=ttl, rooms=rooms)
         raise RuntimeError(
             "IMPOSTER_ROOM_STORE=redis needs REDIS_URL, or KV_REST_API_URL with "
             "KV_REST_API_TOKEN."
         )
     try:
-        return SqliteStore(ttl_seconds=ttl)
+        return SqliteStore(ttl_seconds=ttl, rooms=rooms)
     except (OSError, sqlite3.Error):
         if kind == "sqlite":
             raise

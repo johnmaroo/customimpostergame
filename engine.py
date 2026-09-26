@@ -8,11 +8,15 @@ Rooms live in a `RoomStore` rather than in module state, so a table survives a
 server restart and can be picked up by whichever process handles the next
 request. Session tokens carry the room code and player id, which lets any
 process re-attach a phone by loading that one room.
+
+Seats, tokens and the three game errors now live in `sessions` and `errors`,
+because the buzzer game needs the same pieces. They are imported here under
+the names they have always had, so nothing that reads from `engine` had to
+change.
 """
 
 from __future__ import annotations
 
-import hashlib
 import random
 import secrets
 import time
@@ -20,11 +24,16 @@ from collections import Counter
 from dataclasses import dataclass, field, fields
 from typing import Any, Literal, Protocol
 
+from errors import GameError, StoreConflict, StoreUnavailable
 from prompts import PROMPT_MODES, pick_prompt, prompt_view
+from sessions import TOKEN_SEPARATOR, hash_token
+from sessions import clean_name as _clean_name
+from sessions import new_id as _new_id
+from sessions import random_code as _random_code
+from sessions import read_session_token as _read_session_token
+from sessions import session_token as _session_token
 
-CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ"
 MIN_PLAYERS = 3
-MAX_NAME_LEN = 24
 MAX_WORD_LEN = 48
 MAX_WORDS_PER_ROOM = 200
 ROOM_IDLE_SECONDS = 4 * 60 * 60
@@ -33,37 +42,11 @@ ROOM_SCHEMA_VERSION = 1
 # A phone polling every couple of seconds should keep its table alive without
 # writing to the store on every request.
 ACTIVITY_WRITE_SECONDS = 60.0
-TOKEN_SEPARATOR = "."
 
 Phase = Literal["lobby", "reveal", "discuss", "huddle", "guess", "vote", "results", "ended"]
 Winner = Literal["faithfuls", "imposters"]
 WinReason = Literal["guess", "vote"]
 IrlMode = Literal["off", "classic", "mix", "ask", "do"]
-
-
-class GameError(Exception):
-    def __init__(self, message: str, status_code: int = 400, code: str = "game_error") -> None:
-        super().__init__(message)
-        self.message = message
-        self.status_code = status_code
-        self.code = code
-
-
-class StoreConflict(Exception):
-    """Another writer changed this room first; the caller should retry."""
-
-
-class StoreUnavailable(Exception):
-    """The room store could not be reached. The table is not lost, just unreadable."""
-
-
-def _clean_name(name: str) -> str:
-    cleaned = " ".join((name or "").split())
-    if not cleaned:
-        raise GameError("Enter a name to join.")
-    if len(cleaned) > MAX_NAME_LEN:
-        raise GameError(f"Names can be at most {MAX_NAME_LEN} characters.")
-    return cleaned
 
 
 def _clean_word(word: str) -> str:
@@ -149,28 +132,6 @@ def _deal_speaking_order(
     if previous and previous[:1] == [starter] and set(previous[1:]) == set(rest):
         unlike = previous[1:]
     return [starter] + _shuffled_copy(rng, rest, unlike=unlike)
-
-
-def _new_id() -> str:
-    return secrets.token_urlsafe(9)
-
-
-def hash_token(token: str) -> str:
-    """Rooms are written to disk or a shared cache, so only hashes are stored."""
-    return hashlib.sha256((token or "").encode("utf-8")).hexdigest()
-
-
-def _session_token(code: str, player_id: str) -> str:
-    """A token that says which room and seat it belongs to, plus a secret."""
-    return TOKEN_SEPARATOR.join((code, player_id, secrets.token_urlsafe(24)))
-
-
-def _read_session_token(token: str) -> tuple[str, str] | None:
-    parts = (token or "").strip().split(TOKEN_SEPARATOR)
-    if len(parts) != 3 or not all(parts):
-        return None
-    code, player_id, _secret = parts
-    return code.upper(), player_id
 
 
 def _seat(code: str, name: str, *, is_host: bool, phone: str | None = None) -> Player:
@@ -549,6 +510,10 @@ class MemoryStore:
 
     def load(self, code: str) -> Room | None:
         return self.rooms.get(code)
+
+    def version_of(self, code: str) -> int | None:
+        room = self.rooms.get(code)
+        return None if room is None else room.version
 
     def save(self, room: Room) -> None:
         room.version += 1
@@ -1306,7 +1271,7 @@ class GameHub:
 
     def _unique_code(self) -> str:
         for _ in range(50):
-            code = "".join(self.rng.choice(CODE_ALPHABET) for _ in range(4))
+            code = _random_code(self.rng)
             if self._load(code) is None:
                 return code
         raise GameError("Could not create a room. Try again.", 500)

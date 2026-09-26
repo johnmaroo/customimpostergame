@@ -13,7 +13,6 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import socket
 import threading
 import time
 from collections.abc import Callable
@@ -38,14 +37,17 @@ from notify import (
     qr_svg,
     sms_url,
 )
+from buzzer_api import router as buzzer_router
 from packs import get_pack, list_packs
 from store import create_store, describe_store, room_ttl_seconds
+from web import bearer_token as _token
+from web import lan_ip, public_origin
+from web import retry_on_conflict as _retry
+from web import set_listen_port
 from wordbank import WordBank
 
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
-# Two instances can both write a room; the loser of the race replays its request.
-WRITE_ATTEMPTS = 4
 SWEEP_INTERVAL_SECONDS = 60.0
 
 load_env_file()
@@ -59,11 +61,11 @@ if not room_store.shared:
     logging.getLogger("imposter").warning("Rooms are not shared: %s", room_store.detail)
 bank = WordBank()
 lock = threading.RLock()
-listen_port = 8765
 last_sweep = 0.0
 
 app = FastAPI(title="Imposter", docs_url=None, redoc_url=None)
 app.mount("/static", StaticFiles(directory=STATIC, check_dir=False), name="static")
+app.include_router(buzzer_router)
 
 
 def _cors_origins() -> list[str]:
@@ -132,35 +134,11 @@ class InviteBody(BaseModel):
     phone: str = Field(min_length=7, max_length=24)
 
 
-def _token(authorization: str | None) -> str | None:
-    if not authorization:
-        return None
-    scheme, _, value = authorization.partition(" ")
-    if scheme.lower() != "bearer" or not value:
-        return None
-    return value.strip()
-
-
 def _error(exc: GameError) -> JSONResponse:
     return JSONResponse(
         {"error": exc.message, "code": exc.code},
         status_code=exc.status_code,
     )
-
-
-def _retry(work: Callable[[], Any]) -> Any:
-    """Replay a request when another instance wrote the same room first."""
-    for attempt in range(WRITE_ATTEMPTS):
-        try:
-            return work()
-        except StoreConflict:
-            if attempt == WRITE_ATTEMPTS - 1:
-                raise GameError(
-                    "The table changed while you tapped. Try that again.",
-                    409,
-                    "write_conflict",
-                ) from None
-    raise GameError("The table changed while you tapped. Try that again.", 409, "write_conflict")
 
 
 def _play(
@@ -218,41 +196,6 @@ def _persist_word(word: str, fallback_clue: str | None = None) -> None:
 
 def _clue_for(word: str) -> str | None:
     return get_or_create_clue(bank, word)
-
-
-def lan_ip() -> str:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        sock.connect(("8.8.8.8", 80))
-        return sock.getsockname()[0]
-    except OSError:
-        return "127.0.0.1"
-    finally:
-        sock.close()
-
-
-def public_origin(request: Request) -> str:
-    """Origin phones should open. Localhost is rewritten to the LAN address."""
-    configured = (
-        os.getenv("PUBLIC_ORIGIN") or os.getenv("IMPOSTER_PUBLIC_ORIGIN") or ""
-    ).strip().rstrip("/")
-    if configured:
-        return configured
-    forwarded_host = (request.headers.get("x-forwarded-host") or "").split(",")[0].strip()
-    host_header = forwarded_host or request.headers.get("host") or f"127.0.0.1:{listen_port}"
-    hostname, separator, port = host_header.partition(":")
-    proto = (
-        (request.headers.get("x-forwarded-proto") or request.url.scheme or "http")
-        .split(",")[0]
-        .strip()
-    )
-    if hostname in {"127.0.0.1", "localhost", "::1", "[::1]"}:
-        hostname = lan_ip()
-        port = port or str(listen_port)
-        return f"http://{hostname}:{port}"
-    if not separator:
-        return f"{proto}://{host_header}"
-    return f"{proto}://{host_header}"
 
 
 def _snapshot(room, player, request: Request) -> dict[str, Any]:
@@ -618,19 +561,20 @@ app.frontend("/", directory=str(STATIC), fallback="index.html", check_dir=False)
 
 
 def main() -> None:
-    global listen_port
     parser = argparse.ArgumentParser(description="Imposter party game")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
-    listen_port = args.port
+    set_listen_port(args.port)
     display_ip = lan_ip() if args.host in {"0.0.0.0", "::"} else args.host
     print("\n  IMPOSTER")
     print("  --------")
     print(f"  This computer:  http://127.0.0.1:{args.port}")
     print(f"  Phones (Wi-Fi): http://{display_ip}:{args.port}")
     print("  Friends can scan the QR in the lobby or get a texted join link.")
-    print("  Vercel is optional extra hosting — LAN play does not need it.\n")
+    print(f"\n  Jeopardy buzzer: http://{display_ip}:{args.port}/buzzer")
+    print("  Host it with a password; iPads join with the room code.")
+    print("\n  Vercel is optional extra hosting — LAN play does not need it.\n")
     if not room_store.shared:
         print(f"  Heads up: {room_store.detail}\n")
     if not resolve_api_key():

@@ -1,0 +1,226 @@
+/* The buzzer's own screens, on top of the shared look in styles.css.
+   Two shapes: a phone-width button for the iPads, and a wider console for
+   whatever the host is holding. */
+
+.device.console {
+  width: min(100%, 760px);
+}
+
+.brand {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.segmented {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  padding: 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--line);
+}
+
+.segmented button {
+  appearance: none;
+  border: 0;
+  border-radius: 999px;
+  padding: 11px 12px;
+  font-weight: 600;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+}
+
+.segmented button.on {
+  background: rgba(232, 195, 122, 0.16);
+  color: var(--gold-2);
+}
+
+/* -- the button ------------------------------------------------------- */
+
+.buzz-stage {
+  display: grid;
+  gap: 12px;
+}
+
+.buzz-btn {
+  width: 100%;
+  min-height: min(48vh, 400px);
+  border-radius: 34px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--muted);
+  font-weight: 800;
+  font-size: clamp(1.7rem, 9vw, 3rem);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 12px;
+  padding: 20px;
+  cursor: pointer;
+  /* No waiting to find out whether a tap was going to be a double tap. The
+     buzz itself goes on pointerdown, so nothing here has to wait at all. */
+  touch-action: manipulation;
+  user-select: none;
+  -webkit-user-select: none;
+  transition: background 0.12s ease, border-color 0.12s ease, transform 0.08s ease;
+}
+
+.buzz-btn small {
+  display: block;
+  font-size: 0.82rem;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  text-transform: none;
+  color: var(--muted);
+  max-width: 24ch;
+  line-height: 1.35;
+}
+
+.buzz-btn:active { transform: scale(0.985); }
+
+.buzz-btn.live {
+  background: radial-gradient(circle at 50% 22%, #ff8b99, var(--rose) 60%, #c32a42);
+  border-color: rgba(255, 208, 214, 0.65);
+  color: #2c0a11;
+  box-shadow: 0 0 0 6px rgba(255, 93, 115, 0.14), 0 26px 60px rgba(255, 93, 115, 0.3);
+  animation: ready 0.9s ease-in-out infinite alternate;
+}
+
+.buzz-btn.live small { color: rgba(44, 10, 17, 0.72); }
+
+@keyframes ready {
+  from { box-shadow: 0 0 0 4px rgba(255, 93, 115, 0.12), 0 20px 46px rgba(255, 93, 115, 0.24); }
+  to { box-shadow: 0 0 0 12px rgba(255, 93, 115, 0.08), 0 30px 70px rgba(255, 93, 115, 0.34); }
+}
+
+.buzz-btn.won {
+  background: radial-gradient(circle at 50% 22%, #c8f6da, var(--green) 62%, #5fbe87);
+  border-color: rgba(155, 231, 183, 0.7);
+  color: #0d2a1a;
+}
+
+.buzz-btn.won small { color: rgba(13, 42, 26, 0.7); }
+
+.buzz-btn.sent {
+  background: rgba(232, 195, 122, 0.16);
+  border-color: rgba(232, 195, 122, 0.5);
+  color: var(--gold-2);
+}
+
+.buzz-btn.missed {
+  background: rgba(255, 93, 115, 0.1);
+  border-color: rgba(255, 93, 115, 0.3);
+  color: var(--rose-2);
+}
+
+.buzz-btn.blocked {
+  background: rgba(232, 195, 122, 0.08);
+  border-color: rgba(232, 195, 122, 0.3);
+  color: var(--gold);
+}
+
+.reaction {
+  font-variant-numeric: tabular-nums;
+  font-size: clamp(1rem, 4.5vw, 1.3rem);
+  letter-spacing: 0.04em;
+  text-transform: none;
+  font-weight: 700;
+}
+
+/* -- the console ------------------------------------------------------ */
+
+.stage {
+  border-radius: 26px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.035);
+  padding: 22px 18px;
+  display: grid;
+  gap: 12px;
+  justify-items: center;
+  text-align: center;
+  min-height: 188px;
+  align-content: center;
+}
+
+.stage.open {
+  background: rgba(255, 93, 115, 0.1);
+  border-color: rgba(255, 93, 115, 0.34);
+}
+
+.stage.answering {
+  background: rgba(155, 231, 183, 0.12);
+  border-color: rgba(155, 231, 183, 0.4);
+}
+
+.stage.right { background: rgba(155, 231, 183, 0.1); border-color: rgba(155, 231, 183, 0.3); }
+.stage.wrong { background: rgba(255, 93, 115, 0.1); border-color: rgba(255, 93, 115, 0.3); }
+
+.who {
+  font-family: Fraunces, Georgia, serif;
+  font-size: clamp(2.1rem, 9vw, 3.4rem);
+  line-height: 1.05;
+}
+
+.elapsed {
+  font-variant-numeric: tabular-nums;
+  font-size: clamp(2.4rem, 11vw, 3.6rem);
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  line-height: 1;
+}
+
+.btn-green { background: var(--green); color: #0d2a1a; }
+
+.score-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid transparent;
+}
+
+.score-row.you { border-color: rgba(232, 195, 122, 0.35); }
+.score-row.spent { opacity: 0.5; }
+.score-row.in { border-color: rgba(155, 231, 183, 0.5); background: rgba(155, 231, 183, 0.1); }
+
+.pts {
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  font-size: 1.1rem;
+  min-width: 5ch;
+  text-align: right;
+}
+
+.pts.down { color: var(--rose); }
+
+.dot.away { background: var(--muted); }
+
+.keys {
+  color: var(--muted);
+  font-size: 0.78rem;
+  text-align: center;
+  line-height: 1.5;
+}
+
+.keys kbd {
+  font: inherit;
+  font-weight: 700;
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 1px 6px;
+  background: rgba(255, 255, 255, 0.05);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .buzz-btn.live { animation: none; }
+  .buzz-btn { transition: none; }
+}

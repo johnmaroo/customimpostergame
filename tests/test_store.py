@@ -25,12 +25,15 @@ from engine import (
     serialized_round_fields,
 )
 from store import (
+    IMPOSTER_ROOMS,
     RedisRestStore,
     RedisUrlStore,
+    RoomKind,
     SqliteStore,
     create_store,
     describe_store,
     room_ttl_seconds,
+    version_of,
 )
 
 
@@ -211,6 +214,10 @@ class FakeRedis:
         if name == "DEL":
             self.values.pop(parts[1], None)
             return httpx.Response(200, json={"result": 1})
+        if name == "GETRANGE":
+            value = self.values.get(parts[1], "")
+            start, end = int(parts[2]), int(parts[3])
+            return httpx.Response(200, json={"result": value[start : end + 1]})
         if name == "EVAL":
             if not self.eval_supported:
                 return httpx.Response(200, json={"error": "ERR unknown command 'EVAL'"})
@@ -625,6 +632,10 @@ class FakeRedisClient:
         self._maybe_fail()
         return self.values.get(key)
 
+    def getrange(self, key: str, start: int, end: int) -> str:
+        self._maybe_fail()
+        return self.values.get(key, "")[start : end + 1]
+
     def eval(self, _script: str, _numkeys: int, key: str, expected: str, payload: str, ttl: str):
         self._maybe_fail()
         current = self.values.get(key)
@@ -715,6 +726,101 @@ class RedisUrlStoreTests(unittest.TestCase):
         # Everything but the version, which a second write is meant to move on.
         self.assertEqual(written.pop("version"), original.pop("version") + 1)
         self.assertEqual(written, original)
+
+
+class SecondGameTests(unittest.TestCase):
+    """More than one game is hosted here, and they share the same backends.
+
+    The rooms are written with Imposter's own codec so that what is under
+    test is the filing, not the encoding: the same four-letter code has to
+    mean two different rooms when two games hand it out on the same evening.
+    """
+
+    OTHER_GAME = RoomKind("buzzer:room:", room_to_dict, room_from_dict)
+
+    def test_a_file_keeps_two_games_apart(self) -> None:
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "rooms.db"
+            imposter = SqliteStore(path)
+            other = SqliteStore(path, rooms=self.OTHER_GAME)
+            self.addCleanup(imposter.close)
+            self.addCleanup(other.close)
+
+            room, _ = GameHub(store=imposter).create_room("Host")
+            self.assertIsNone(other.load(room.code))
+
+            elsewhere = Room(code=room.code, players={})
+            other.save(elsewhere)
+            self.assertEqual(len(imposter.load(room.code).players), 1)
+            self.assertEqual(other.load(room.code).players, {})
+
+    def test_a_cache_keeps_two_games_apart(self) -> None:
+        fake = FakeRedis()
+        room, _ = GameHub(store=redis_store(fake)).create_room("Host")
+        redis_store(fake, rooms=self.OTHER_GAME).save(Room(code=room.code, players={}))
+
+        self.assertIn(f"imposter:room:{room.code}", fake.values)
+        self.assertIn(f"buzzer:room:{room.code}", fake.values)
+        self.assertEqual(len(redis_store(fake).load(room.code).players), 1)
+
+    def test_imposter_rooms_are_filed_where_they_always_were(self) -> None:
+        self.assertEqual(IMPOSTER_ROOMS.key("KNTQ"), "imposter:room:KNTQ")
+
+
+class VersionWatchTests(unittest.TestCase):
+    """Watching a room for a change should not cost a whole room read."""
+
+    def stores(self) -> list[Any]:
+        folder = TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        sqlite = SqliteStore(Path(folder.name) / "rooms.db")
+        self.addCleanup(sqlite.close)
+        return [MemoryStore(), sqlite, redis_store(FakeRedis()), self.url_store()]
+
+    def url_store(self) -> RedisUrlStore:
+        return RedisUrlStore("redis://fake", client=FakeRedisClient())
+
+    def test_every_backend_reports_the_version_it_stored(self) -> None:
+        for store in self.stores():
+            with self.subTest(store=type(store).__name__):
+                hub = GameHub(store=store)
+                room, host = hub.create_room("Host")
+                self.assertEqual(version_of(store, room.code), store.load(room.code).version)
+
+                before = version_of(store, room.code)
+                hub.add_word(room, host, "Toaster")
+                self.assertGreater(version_of(store, room.code), before)
+
+    def test_a_room_that_is_not_there_has_no_version(self) -> None:
+        for store in self.stores():
+            with self.subTest(store=type(store).__name__):
+                self.assertIsNone(version_of(store, "ZZZZ"))
+
+    def test_a_store_that_cannot_answer_cheaply_is_still_asked(self) -> None:
+        """`RoomStore` only promises `load`, so the slow way has to work too."""
+
+        class PlainStore:
+            def __init__(self) -> None:
+                self.rooms: dict[str, Room] = {}
+
+            def load(self, code: str) -> Room | None:
+                return self.rooms.get(code)
+
+            def save(self, room: Room) -> None:
+                room.version += 1
+                self.rooms[room.code] = room
+
+            def delete(self, code: str) -> None:
+                self.rooms.pop(code, None)
+
+            def sweep(self, older_than: float) -> None:
+                pass
+
+        store = PlainStore()
+        self.assertFalse(hasattr(store, "version_of"))
+        room, _ = GameHub(store=store).create_room("Host")
+        self.assertEqual(version_of(store, room.code), store.load(room.code).version)
+        self.assertIsNone(version_of(store, "ZZZZ"))
 
 
 NO_REDIS = {

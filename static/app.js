@@ -558,6 +558,7 @@ function renderHome() {
       <li>Then a short open floor to discuss. Imposters get one private guess — name the word and they win.</li>
       <li>If they miss, the table votes. Catch an imposter and the faithfuls score.</li>
     </ol></div>` : ""}
+    <p class="hint"><a class="linkish" href="/buzzer">Running a quiz instead? There is a Jeopardy buzzer here.</a></p>
   </section>`;
 
   app.querySelector("#how-toggle").onclick = () => {

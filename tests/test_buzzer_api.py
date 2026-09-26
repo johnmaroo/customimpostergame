@@ -333,6 +333,47 @@ class HoldingTheLineTests(unittest.TestCase):
         self.assertGreaterEqual(waited, 0.9)
         self.assertLess(waited, 4.0)
 
+    def test_a_hold_that_gives_up_answers_with_the_clock_as_it_is_now(self) -> None:
+        """A hold that runs its course reads the room again before answering.
+
+        The console counts the open buzzers up from `serverNow`, so answering
+        with a reading taken before the hold began sends that clock backwards
+        by however long the device happened to be waiting.
+        """
+        self.client.post(
+            "/api/buzz/room/open", headers={"Authorization": f"Bearer {self.host}"}
+        )
+        before = self.client.get(
+            "/api/buzz/room", headers={"Authorization": f"Bearer {self.ava}"}
+        ).json()
+
+        answer = self.watch(self.ava, before["rev"], wait=1.0).json()
+
+        self.assertEqual(answer["rev"], before["rev"])
+        self.assertGreaterEqual(answer["serverNow"], before["serverNow"] + 0.9)
+
+    def test_a_lockout_that_has_run_out_is_answered_as_over(self) -> None:
+        """Nothing about the room changes when a lockout lapses.
+
+        A false start only holds the button for a fraction of a second, so a
+        device told to keep waiting has to be told the lockout is over too, or
+        it sits out the whole clue over a 250ms penalty.
+        """
+        self.client.post(
+            "/api/buzz/room/buzz", headers={"Authorization": f"Bearer {self.ava}"}
+        )
+        self.client.post(
+            "/api/buzz/room/open", headers={"Authorization": f"Bearer {self.host}"}
+        )
+        before = self.client.get(
+            "/api/buzz/room", headers={"Authorization": f"Bearer {self.ava}"}
+        ).json()
+        self.assertGreater(before["you"]["lockedForMs"], 0)
+
+        answer = self.watch(self.ava, before["rev"], wait=1.0).json()
+
+        self.assertEqual(answer["you"]["lockedForMs"], 0)
+
     def test_every_ipad_in_the_room_is_answered_by_one_tap(self) -> None:
         names = ["Ben", "Cara", "Dev"]
         tokens = [self.ava] + [

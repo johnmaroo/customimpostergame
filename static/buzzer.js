@@ -234,11 +234,22 @@ function tickClock() {
   clearInterval(clockId);
   clockId = setInterval(() => {
     const snap = state.snapshot;
-    if (!snap || snap.phase !== "open" || !snap.openedAt) return;
+    if (!snap || snap.phase !== "open") return;
+    if (snap.lockedUntil && Date.now() >= snap.lockedUntil) {
+      snap.lockedUntil = 0;
+      render();
+      return;
+    }
+    if (!snap.openedAt) return;
     const face = app.querySelector(".elapsed");
     if (!face) return;
     face.textContent = seconds(sinceOpen(snap));
   }, 100);
+}
+
+function lockedFor(snap) {
+  if (!snap.lockedUntil) return 0;
+  return Math.max(0, snap.lockedUntil - Date.now());
 }
 
 function sinceOpen(snap) {
@@ -261,7 +272,14 @@ function toast() {
 
 function render() {
   const snap = state.snapshot;
-  if (snap) snap.receivedAt = snap.receivedAt || Date.now();
+  if (snap && !snap.receivedAt) {
+    snap.receivedAt = Date.now();
+    // A lockout is kept as a deadline on this device's own clock. The room
+    // does not change when a penalty runs out, so nothing is coming from the
+    // server to say the button is live again.
+    const locked = snap.you?.lockedForMs || 0;
+    snap.lockedUntil = locked > 0 ? snap.receivedAt + locked : 0;
+  }
   app.classList.toggle("console", Boolean(snap?.you?.isHost));
   if (!snap) {
     if (state.token) renderReconnecting();
@@ -421,7 +439,7 @@ function buzzFace(snap) {
   if (you.spent) {
     return { look: "blocked", lead: "You're out", note: "You had this one. Waiting for the next clue." };
   }
-  if (snap.phase === "open" && you.lockedForMs > 0) {
+  if (snap.phase === "open" && lockedFor(snap) > 0) {
     return { look: "blocked", lead: "Locked out", note: "You buzzed before the clue. Your button opens in a moment." };
   }
   if (snap.phase === "open") {

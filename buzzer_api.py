@@ -339,7 +339,10 @@ async def _hold(
     while True:
         left = deadline - loop.time()
         if left <= 0:
-            return view
+            # Some of the room is the clock rather than the room: how long the
+            # buzzers have been open, how much of a lockout is left. A reading
+            # taken before the hold is already wrong by the length of it.
+            return await asyncio.to_thread(_read, token, request)
         await wakeups.wait(code, min(_until_next_tick(), left))
         version = await asyncio.to_thread(version_of, hub.store, code)
         if version == seen:
